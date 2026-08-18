@@ -1,27 +1,24 @@
-"""WorkBuddy 每日签到自动化脚本（自包含决策版，跨平台可分享）。
+"""WorkBuddy 每日签到自动领取脚本。
 
-读取本机 WorkBuddy 客户端已登录的会话凭据，调用客户端自身使用的签到接口：
+读取本机 WorkBuddy 桌面端的登录会话，调用其签到接口自动领取每日积分：
   POST {endpoint}/v2/billing/meter/checkin-activity-status  查询签到状态
   POST {endpoint}/v2/billing/meter/daily-checkin            领取今日积分
 
-响应契约（从客户端 app.asar 逆出，2026-08-06 验证，2026-08-18 复测修订）：
-  - 领取成功 : 返回对象且含 credit 字段，如 {"credit": 100}
-  - 今日已签 : 返回 null（旧形态）或 HTTP 400 + {"code":10001,"msg":"今天已签到，请明天再来"}（现行）
-                幂等，重复调用不会多给积分；两种形态都按"已签"处理，不计为失败
-  - 业务错误 : 返回 {"code": ..., "msg": ...}
+响应契约：
+  - 领取成功 : 含 credit 字段，如 {"credit": 100}
+  - 今日已签 : null 或 HTTP 400 + {"code":10001,"msg":"今天已签到，请明天再来"}
+               幂等，两种形态都按"已签"处理，不计失败
+  - 业务错误 : {"code": ..., "msg": ...}
   - 登录失效 : HTTP 401/403，需重新登录桌面端
 
-凭据文件由 WorkBuddy 桌面端登录后自动写入（明文 JSON，含 accessToken）。
-脚本会自动按平台探测该文件路径；也可通过环境变量 WORKBUDDY_AUTH_FILE 强制指定。
+凭据文件由桌面端登录后自动写入；脚本按平台自动探测，或用环境变量
+WORKBUDDY_AUTH_FILE 指定。任何模式下都不会打印令牌，可安全分享。
 
 用法：
-  python checkin.py auto     # 推荐给每日自动化：查状态→未签才领→输出一行汇报
-  python checkin.py status   # 仅查状态（调试）
-  python checkin.py claim    # 仅领取（调试，幂等安全）
-  python checkin.py all      # 查状态 + 领取（调试）
-
-任何模式下都不会打印令牌（accessToken / Authorization 头）。本脚本可安全分享给他人，
-它只读取运行者自己机器上的登录凭据，不含任何第三方密钥。
+  python signin.py auto     # 每日自动化：查状态→未签才领→输出一行汇报
+  python signin.py status   # 仅查状态（调试）
+  python signin.py claim    # 仅领取（调试，幂等）
+  python signin.py all      # 查状态 + 领取（调试）
 """
 
 import json
@@ -43,10 +40,10 @@ def find_auth_file():
     home = os.path.expanduser("~")
     local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
     candidates = [
-        os.path.join(local, AUTH_BASENAME),                                       # Windows
-        os.path.join(home, "Library", "Application Support", AUTH_BASENAME),      # macOS
-        os.path.join(home, ".config", AUTH_BASENAME),                             # Linux
-        os.path.join(home, ".workbuddy", "auth", "workbuddy-desktop.info"),       # 兜底
+        os.path.join(local, AUTH_BASENAME),                                  # Windows
+        os.path.join(home, "Library", "Application Support", AUTH_BASENAME),  # macOS
+        os.path.join(home, ".config", AUTH_BASENAME),                        # Linux
+        os.path.join(home, ".workbuddy", "auth", "workbuddy-desktop.info"),  # 兜底
     ]
     for c in candidates:
         if os.path.exists(c):
@@ -97,7 +94,7 @@ def post(url, headers, payload=None):
 
 
 def dig(obj, key):
-    """在（可能被 data/result 包裹的）响应里找字段，兼容信封结构。"""
+    """在可能被 data/result 包裹的响应里找字段，兼容信封结构。"""
     if isinstance(obj, dict):
         if key in obj and obj[key] is not None:
             return obj[key]
@@ -116,20 +113,19 @@ def fmt_credit(v):
         return v
 
 
-def _is_already_checked_in(ccode, cbody):
-    """判断领取接口的返回是否表示"今日已签"（兼容 null 与 400+code10001 两种形态）。"""
+def _is_already_checked_in(cbody):
+    """领取接口返回是否表示"今日已签"（兼容 null 与 400+code10001）。"""
     if cbody is None:
         return True
     if isinstance(cbody, dict):
-        code = cbody.get("code")
         msg = cbody.get("msg") or ""
-        if code == 10001 or "已签到" in msg or "已签" in msg:
+        if cbody.get("code") == 10001 or "已签" in msg:
             return True
     return False
 
 
 def _already_report(status, via=None):
-    """根据（新鲜的）状态构造"今日已签"汇报 dict。"""
+    """根据状态构造"今日已签"汇报 dict。"""
     today_credit = dig(status, "today_credit") or dig(status, "daily_credit")
     streak_days = dig(status, "streak_days")
     total_credits = dig(status, "total_credits")
@@ -159,7 +155,6 @@ def run_auto(headers, endpoint):
     """每日自动化主逻辑：查状态→未签才领→返回一行汇报。"""
     scode, sbody = post(endpoint + "/v2/billing/meter/checkin-activity-status", headers)
 
-    # 登录态失效单独识别，给出明确处置建议
     if scode in (401, 403):
         return 1, {
             "result": "NO_SESSION",
@@ -178,25 +173,20 @@ def run_auto(headers, endpoint):
     active = dig(status, "active")
     activity_name = dig(status, "activity_name")
 
-    # 活动未开启（非签到季）：不调用领取，直接告知
     if active is False:
         report = "签到活动未开启" + ("（%s）" % activity_name if activity_name else "")
         return 0, {"result": "INACTIVE", "report": report, "active": False}
 
-    today_checked_in = dig(status, "today_checked_in")
-    if today_checked_in is True:
+    if dig(status, "today_checked_in") is True:
         return 0, _already_report(status)
 
-    # 未签到 → 领取（幂等安全：重复调用不会多给）
     ccode, cbody = post(endpoint + "/v2/billing/meter/daily-checkin", headers)
 
-    # 领取接口也可能返回"已签"（400+code10001 或 null），重拉状态给出准确汇报
-    if _is_already_checked_in(ccode, cbody):
+    if _is_already_checked_in(cbody):
         scode2, sbody2 = post(endpoint + "/v2/billing/meter/checkin-activity-status", headers)
         fresh = sbody2 if (200 <= scode2 < 300 and isinstance(sbody2, dict)) else status
         return 0, _already_report(fresh, via="今日已签过（服务端判定已领取）")
 
-    # 登录态失效（领取侧）
     if ccode in (401, 403):
         return 1, {
             "result": "NO_SESSION",
@@ -206,7 +196,6 @@ def run_auto(headers, endpoint):
 
     credit = dig(cbody, "credit")
     if credit is not None:
-        # 领取成功后重拉一次状态，取准确的连续天数/累计积分
         scode2, sbody2 = post(endpoint + "/v2/billing/meter/checkin-activity-status", headers)
         fresh = sbody2 if (200 <= scode2 < 300 and isinstance(sbody2, dict)) else status
         streak_days = dig(fresh, "streak_days") or dig(status, "streak_days")
@@ -235,7 +224,6 @@ def run_auto(headers, endpoint):
             "claim_body": cbody,
         }
 
-    # 兜底：不认识的结构
     return 1, {
         "result": "UNKNOWN",
         "report": "未识别的领取返回，请检查接口：%s" % json.dumps(cbody, ensure_ascii=False)[:200],
@@ -265,8 +253,7 @@ def main():
 
     session = load_session(auth_file)
     headers = build_headers(session)
-    endpoint = (session.get("auth") or {}).get("endpoint") or DEFAULT_ENDPOINT
-    endpoint = endpoint.rstrip("/")
+    endpoint = ((session.get("auth") or {}).get("endpoint") or DEFAULT_ENDPOINT).rstrip("/")
 
     if action == "auto":
         code, out = run_auto(headers, endpoint)

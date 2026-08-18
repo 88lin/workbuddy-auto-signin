@@ -30,29 +30,29 @@ WorkBuddy（腾讯的 AI 编程助手）每天可以通过签到领取免费积�
 ```bash
 git clone https://github.com/88lin/workbuddy-auto-signin.git
 cd workbuddy-auto-signin
-python checkin.py auto
+python signin.py auto
 ```
 看到 `今日已签过` 或 `成功领取 N 积分` 就说明通了。
 
 ## 用法
 ```
-python checkin.py auto     # 每日自动化：查状态→未签才领→输出一行汇报
-python checkin.py status   # 仅查状态（调试）
-python checkin.py claim    # 仅领取（调试，幂等安全）
-python checkin.py all      # 查状态 + 领取（调试）
+python signin.py auto     # 每日自动化：查状态→未签才领→输出一行汇报
+python signin.py status   # 仅查状态（调试）
+python signin.py claim    # 仅领取（调试，幂等安全）
+python signin.py all      # 查状态 + 领取（调试）
 ```
 输出始终是一行 JSON，`report` 字段是可读的中文汇报。
 
 ## 设置每天自动领（00:05）
 推荐用 **WorkBuddy 的定时自动化**。本脚本依赖你**本机**的桌面端登录态，所以云端 CI（如 GitHub Actions）跑不了。
 
-1. 把 `checkin.py` 放到固定位置，例如 `<工作区>/.workbuddy/automations/daily-checkin/checkin.py`。
+1. 把 `signin.py` 放到固定位置，例如 `<工作区>/.workbuddy/automations/daily-checkin/signin.py`。
 2. 在 WorkBuddy 里新建自动化：
    - **名称**：每日自动领 WorkBuddy 积分
    - **计划**：每天 00:05
    - **提示词**：
      ```
-     运行 python "<checkin.py 绝对路径>" auto，
+     运行 python "<signin.py 绝对路径>" auto，
      把命令输出的 JSON 里 report 字段的内容，直接一句话汇报给我。
      若 report 含"领取失败"或"登录态已失效"，提醒我重新登录 WorkBuddy 桌面端。
      ```
@@ -68,7 +68,7 @@ python checkin.py all      # 查状态 + 领取（调试）
 | `NO_AUTH / 未找到登录凭据` | 先登录一次 WorkBuddy 桌面端；或设置 `WORKBUDDY_AUTH_FILE`。 |
 | `NO_SESSION / HTTP 401\|403` | 登录态过期——重新登录桌面端，自动化会自动恢复。 |
 | `INACTIVE / 签到活动未开启` | 当前不在签到活动期内，属正常，无需处理。 |
-| 调试原始接口返回 | `python checkin.py status` 或 `python checkin.py all`。 |
+| 调试原始接口返回 | `python signin.py status` 或 `python signin.py all`。 |
 
 ## 安全与隐私
 - 脚本只读取**你自己本机**的 WorkBuddy 会话文件，不含、不内嵌、不传输任何第三方密钥。
