@@ -28,8 +28,8 @@ WorkBuddy（腾讯的 AI 编程助手）每天可以通过签到领取免费积�
 
 ## 快速开始
 ```bash
-git clone https://github.com/88lin/workbuddy-checkin.git
-cd workbuddy-checkin
+git clone https://github.com/88lin/workbuddy-auto-signin.git
+cd workbuddy-auto-signin
 python checkin.py auto
 ```
 看到 `今日已签过` 或 `成功领取 N 积分` 就说明通了。
