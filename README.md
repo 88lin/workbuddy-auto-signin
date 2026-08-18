@@ -1,4 +1,4 @@
-# workbuddy-checkin
+# workbuddy-auto-signin
 
 > 一个自包含的小脚本，每天自动帮你领取 **WorkBuddy** 的每日签到积分。零依赖、零内置密钥——只要在本机登录过 WorkBuddy 桌面端就能跑。
 
@@ -46,7 +46,7 @@ python signin.py all      # 查状态 + 领取（调试）
 ## 设置每天自动领（00:05）
 推荐用 **WorkBuddy 的定时自动化**。本脚本依赖你**本机**的桌面端登录态，所以云端 CI（如 GitHub Actions）跑不了。
 
-1. 把 `signin.py` 放到固定位置，例如 `<工作区>/.workbuddy/automations/daily-checkin/signin.py`。
+1. 把 `signin.py` 放到固定位置，例如 `<工作区>/.workbuddy/automations/daily-signin/signin.py`。
 2. 在 WorkBuddy 里新建自动化：
    - **名称**：每日自动领 WorkBuddy 积分
    - **计划**：每天 00:05
