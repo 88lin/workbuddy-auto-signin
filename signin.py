@@ -15,10 +15,11 @@
 WORKBUDDY_AUTH_FILE 指定。任何模式下都不会打印令牌，可安全分享。
 
 用法：
-  python signin.py auto     # 每日自动化：查状态→未签才领→输出一行汇报
-  python signin.py status   # 仅查状态（调试）
-  python signin.py claim    # 仅领取（调试，幂等）
-  python signin.py all      # 查状态 + 领取（调试）
+  python signin.py auto     # 每日自动化：签到 + 成长中心（领旅行礼物/派Buddy/开盲盒/领任务奖）
+  python signin.py growth   # 仅成长中心（不签到）
+  python signin.py status   # 仅查签到状态（调试）
+  python signin.py claim    # 仅领取签到（调试，幂等）
+  python signin.py all      # 查签到状态 + 领取（调试）
 """
 
 import json
@@ -78,19 +79,33 @@ def build_headers(session):
     return headers
 
 
-def post(url, headers, payload=None):
-    body = json.dumps(payload or {}).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+def _request(url, headers, method="GET", payload=None):
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
     ctx = ssl.create_default_context()
     try:
         with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            try:
+                return resp.status, json.loads(raw)
+            except Exception:
+                return resp.status, {"raw": raw[:500]}
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", "replace")
         try:
             return e.code, json.loads(raw)
         except Exception:
             return e.code, {"raw": raw[:500]}
+
+
+def post(url, headers, payload=None):
+    return _request(url, headers, method="POST", payload=payload)
+
+
+def get(url, headers):
+    return _request(url, headers, method="GET")
 
 
 def dig(obj, key):
@@ -149,6 +164,95 @@ def _already_report(status, via=None):
         "is_streak_day": is_streak_day,
         "next_streak_day": next_streak_day,
     }
+
+
+def run_growth(headers, endpoint):
+    """成长中心自动化：领旅行礼物→派 Buddy 出发→开盲盒→领任务奖→汇报。"""
+    base = endpoint + "/v2/activity/growth"
+    parts = []
+    credits_gained = 0
+
+    # --- 1. Buddy 旅行：领礼物 + 派出发 ---
+    scode, sbody = get(base + "/buddy/travel/status", headers)
+    travel = dig(sbody, "state") if (200 <= scode < 300) else None
+
+    if scode in (401, 403):
+        return 1, {"result": "NO_SESSION",
+                   "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
+    if travel == "arrived":
+        record_id = dig(sbody, "record_id")
+        reward = dig(sbody, "reward_credit") or 0
+        ccode, cbody = post(base + "/buddy/travel/claim", headers, {"record_id": record_id})
+        if 200 <= ccode < 300 and dig(cbody, "reward_credit") is not None:
+            got = dig(cbody, "reward_credit")
+            credits_gained += got
+            parts.append("领旅行礼物 +%s 积分" % fmt_credit(got))
+        else:
+            parts.append("领旅行礼物失败（HTTP %s）" % ccode)
+        travel = "idle"  # 领完后变 idle
+    if travel == "idle":
+        ccode, cbody = get(base + "/buddy/travel/config", headers)
+        locs = dig(cbody, "locations") if (200 <= ccode < 300) else None
+        if locs:
+            loc = locs[0]
+            dcode, dbody = post(base + "/buddy/travel/depart", headers, {"location_id": loc.get("id")})
+            if 200 <= dcode < 300:
+                loc_name = (dig(dbody, "location") or {}).get("name", "?")
+                dur = dig(dbody, "duration_hours") or (dig(dbody, "location") or {}).get("duration_hours", "?")
+                parts.append("派 Buddy 去%s（%s 小时后回）" % (loc_name, dur))
+            else:
+                msg = dig(dbody, "msg") or ""
+                parts.append("派 Buddy 失败：%s" % (msg or ("HTTP %s" % dcode)))
+    elif travel == "traveling":
+        loc_name = (dig(sbody, "location") or {}).get("name", "?")
+        parts.append("Buddy 旅行中（%s）" % loc_name)
+
+    # --- 2. 盲盒/抽奖 ---
+    lcode, lbody = get(base + "/lottery/chances", headers)
+    chances = dig(lbody, "balance") if (200 <= lcode < 300) else 0
+    if chances and chances > 0:
+        dcode, dbody = post(base + "/lottery/draw", headers, {})
+        if 200 <= dcode < 300:
+            prize = dig(dbody, "prize_name") or dig(dbody, "prize") or "未知"
+            parts.append("开盲盒获得：%s" % prize)
+        else:
+            parts.append("开盲盒失败（HTTP %s）" % dcode)
+
+    # --- 3. 任务领奖 ---
+    tcode, tbody = get(base + "/tasks", headers)
+    if 200 <= tcode < 300:
+        tasks = dig(tbody, "tasks") or []
+        for t in tasks:
+            done = (t.get("progress") or {}).get("current", 0) >= (t.get("progress") or {}).get("target", 1)
+            if done and t.get("accept_status") != "claimed" and t.get("has_reward"):
+                acode, abody = post(base + "/tasks/accept", headers, {"task_code": t.get("task_code")})
+                if 200 <= acode < 300:
+                    rc = t.get("reward_credit", 0)
+                    re_ = t.get("reward_energy", 0)
+                    credits_gained += rc
+                    parts.append("领任务奖「%s」+credit%s+energy%s" % (t.get("title", t.get("task_code")), rc, re_))
+
+    # --- 4. 能量 & 连签状态 ---
+    ecode, ebody = get(base + "/energy", headers)
+    energy = dig(ebody, "balance") if (200 <= ecode < 300) else None
+
+    scode2, sbody2 = get(base + "/streak", headers)
+    streak_obj = dig(sbody2, "streak") or {}
+    streak_days = streak_obj.get("days") if isinstance(streak_obj, dict) else None
+
+    tail = []
+    if energy is not None:
+        tail.append("能量 %s" % energy)
+    if streak_days is not None:
+        tail.append("连签 %s 天" % streak_days)
+    if credits_gained:
+        tail.append("本次 +共 %s 积分" % credits_gained)
+
+    report = "；".join(parts) if parts else "成长中心无可领取项"
+    if tail:
+        report += "（%s）" % "，".join(tail)
+    return 0, {"result": "GROWTH", "report": report, "credits_gained": credits_gained,
+               "energy": energy, "streak_days": streak_days}
 
 
 def run_auto(headers, endpoint):
@@ -257,6 +361,16 @@ def main():
 
     if action == "auto":
         code, out = run_auto(headers, endpoint)
+        # 签到后顺带跑成长中心
+        gcode, gout = run_growth(headers, endpoint)
+        out["growth"] = gout.get("report")
+        if gout.get("credits_gained"):
+            out["report"] += "；" + gout["report"]
+        print(json.dumps(out, ensure_ascii=False))
+        return code
+
+    if action == "growth":
+        code, out = run_growth(headers, endpoint)
         print(json.dumps(out, ensure_ascii=False))
         return code
 
