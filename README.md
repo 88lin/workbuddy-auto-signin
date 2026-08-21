@@ -37,8 +37,9 @@ https://github.com/88lin/workbuddy-auto-signin
 | | |
 |:---:|---|
 | 🧩 | **零依赖** — 纯 Python 标准库，不用 `pip install`，任意 Python 3 即可 |
-| 📦 | **单文件** — 约 290 行，完全自包含 |
+| 📦 | **单文件** — 完全自包含 |
 | 🔁 | **幂等安全** — 先查状态，未签才领；重复运行不会多领 |
+| 🐱 | **成长中心** — 自动领 Buddy 旅行礼物、派 Buddy 出发、开盲盒、领任务奖励 |
 | 🧠 | **智能汇报** — 一行 JSON，如 `成功领取 100 积分（连续 7 天，累计 700 积分）` |
 | 🛡️ | **健壮** — 兼容"已签"两种返回形态、识别 401/403 登录态过期、识别非签到季 |
 | 🌐 | **跨平台** — 自动探测 Windows / macOS / Linux 凭据文件 |
@@ -76,10 +77,11 @@ python signin.py auto
 ```
 
 ```
-python signin.py auto     # 每日自动化：查状态→未签才领→输出一行汇报
-python signin.py status   # 仅查状态（调试）
-python signin.py claim    # 仅领取（调试，幂等）
-python signin.py all      # 查状态 + 领取（调试）
+python signin.py auto     # 每日自动化：签到 + 成长中心（领旅行礼物/派Buddy/开盲盒/领任务奖）
+python signin.py growth   # 仅成长中心（不签到）
+python signin.py status   # 仅查签到状态（调试）
+python signin.py claim    # 仅领取签到（调试，幂等）
+python signin.py all      # 查签到状态 + 领取（调试）
 ```
 
 看到 `今日已签过` 或 `成功领取 N 积分` 就说明通了。
