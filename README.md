@@ -41,34 +41,6 @@
 
 ---
 
-## 🚀 快速开始
-
-Clone 下来跑一次，确认能通：
-
-```bash
-git clone https://github.com/88lin/workbuddy-auto-signin.git
-cd workbuddy-auto-signin
-python signin.py auto
-```
-
-看到 `今日已签过` 或 `成功领取 N 积分` 就说明通了。
-
-<details>
-<summary>📖 全部命令</summary>
-
-```
-python signin.py auto     # 签到 + 成长中心（领旅行礼物/派Buddy/开盲盒/领任务奖）
-python signin.py silent   # 同 auto，但输出写入日志文件而非 stdout（配合定时任务静默运行）
-python signin.py growth   # 仅成长中心（不签到）
-python signin.py status   # 仅查签到状态（调试）
-python signin.py claim    # 仅领取签到（调试，幂等）
-python signin.py all      # 查签到状态 + 领取（调试）
-```
-
-</details>
-
----
-
 ## ⏰ 每日定时自动化
 
 本脚本依赖本机桌面端登录态，云端 CI（如 GitHub Actions）跑不了。提供**两种定时模式**，按需选择：
@@ -85,7 +57,7 @@ python signin.py all      # 查签到状态 + 领取（调试）
 | **可靠性** | 依赖模型可用性 | 纯系统级，更可靠 |
 | **日志** | 在聊天记录里 | 独立日志文件 `signin.log` |
 | **关机错过** | 错过就错过 | 可设"错过后下次启动时补跑" |
-| **设置难度** | 低（在 WorkBuddy 里建自动化） | 中（一条 PowerShell 命令） |
+| **设置难度** | 低（在 WorkBuddy 里建自动化） | 中（一条命令） |
 
 ---
 
@@ -117,7 +89,7 @@ python signin.py all      # 查签到状态 + 领取（调试）
 
 用 Windows 自带的任务计划程序 + `pythonw.exe`（无窗口 Python）直接运行脚本，**完全不经过 AI 模型**。
 
-**一键设置**（以管理员或普通 PowerShell 运行）：
+**一键设置**（在终端中运行）：
 
 ```powershell
 # 替换为你的 pythonw.exe 和 signin.py 实际路径
@@ -157,7 +129,39 @@ Unregister-ScheduledTask -TaskName "WorkBuddyAutoSignin" -Confirm:$false
 ```
 
 > [!TIP]
+> **懒人一键**：直接把仓库链接发给 WorkBuddy，让它帮你创建 Windows 定时任务——
+> `帮我在 Windows 上用任务计划程序设置这个仓库每天 00:05 静默自动签到（pythonw.exe + silent 模式，错过后补跑）：https://github.com/88lin/workbuddy-auto-signin`
+
+> [!NOTE]
 > 模式 B 的 `silent` 参数让脚本把结果写入 `signin.log` 而非 stdout，配合 `pythonw.exe`（无控制台窗口）实现完全静默。日志文件路径可用环境变量 `WORKBUDDY_SIGNIN_LOG` 覆盖。
+
+---
+
+## 🛠️ 手动运行（调试用）
+
+如需手动跑一次确认脚本可用：
+
+```bash
+git clone https://github.com/88lin/workbuddy-auto-signin.git
+cd workbuddy-auto-signin
+python signin.py auto
+```
+
+看到 `今日已签过` 或 `成功领取 N 积分` 就说明通了。
+
+<details>
+<summary>📖 全部命令</summary>
+
+```
+python signin.py auto     # 签到 + 成长中心（领旅行礼物/派Buddy/开盲盒/领任务奖）
+python signin.py silent   # 同 auto，但输出写入日志文件而非 stdout（配合定时任务静默运行）
+python signin.py growth   # 仅成长中心（不签到）
+python signin.py status   # 仅查签到状态（调试）
+python signin.py claim    # 仅领取签到（调试，幂等）
+python signin.py all      # 查签到状态 + 领取（调试）
+```
+
+</details>
 
 ---
 
