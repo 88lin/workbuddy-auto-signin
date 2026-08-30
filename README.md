@@ -20,7 +20,7 @@
 
 ## ✨ 特性
 
-| | |
+| | 特性 |
 |:---:|---|
 | 🧩 | **零依赖** — 纯 Python 标准库，不用 `pip install`，任意 Python 3 即可 |
 | 📦 | **单文件** — 完全自包含 |
@@ -75,7 +75,7 @@ python signin.py all      # 查签到状态 + 领取（调试）
 
 ### 模式对比
 
-| | 模式 A：AI 自动化 | 模式 B：系统级静默 |
+| 对比项 | 模式 A：AI 自动化 | 模式 B：系统级静默 ⭐ |
 |:---:|---|---|
 | **平台** | 🌐 Win / macOS / Linux | 🪟 仅 Windows |
 | **原理** | WorkBuddy 自动化触发 → AI 模型跑脚本 → 模型汇报 | Windows 任务计划程序 → `pythonw.exe` 直接跑脚本 → 写日志文件 |
@@ -120,8 +120,10 @@ python signin.py all      # 查签到状态 + 领取（调试）
 **一键设置**（以管理员或普通 PowerShell 运行）：
 
 ```powershell
-$pythonw = "C:\Users\<你>\.workbuddy\binaries\python\versions\3.13.12\pythonw.exe"
-$signin  = "C:\Users\<你>\Desktop\workbuddy-auto-signin\signin.py"
+# 替换为你的 pythonw.exe 和 signin.py 实际路径
+# pythonw.exe 可用任意 Python 3 自带的，不限于 WorkBuddy 托管版本
+$pythonw = "pythonw.exe"   # 或完整路径，如 C:\Python313\pythonw.exe
+$signin  = (Resolve-Path "signin.py").Path  # 或写绝对路径
 
 # 创建定时任务：每天 00:05 静默运行，错过后下次启动时补跑
 $action   = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$signin`" silent"
