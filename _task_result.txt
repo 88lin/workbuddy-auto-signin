@@ -1,5 +1,0 @@
-Action created OK
-Trigger created OK
-ERROR: System.Management.Automation.ParameterBindingException
-MSG: A parameter cannot be found that matches parameter name 'DontRepeatIfStillRunning'.
-INNER: 
