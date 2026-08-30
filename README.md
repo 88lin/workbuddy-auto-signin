@@ -34,15 +34,6 @@
 
 ---
 
-## 📊 Star History
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/88lin/workbuddy-auto-signin/star-history/assets/my-star-history/star-history-dark.svg">
-  <img alt="Star History" src="https://raw.githubusercontent.com/88lin/workbuddy-auto-signin/star-history/assets/my-star-history/star-history-light.svg">
-</picture>
-
----
-
 ## 📋 前置条件
 
 - ✅ 已安装并**登录过 WorkBuddy 桌面端**（登录后自动写出凭据文件）
@@ -224,6 +215,15 @@ python signin.py all      # 查签到状态 + 领取（调试）
 
 > [!WARNING]
 > 本项目为**非官方**工具，与腾讯或 WorkBuddy 无任何隶属关系。签到接口系从桌面端 `app.asar` 逆向得到。使用风险自负；接口可能随时变动且不另行通知。请遵守相关服务条款。
+
+---
+
+## 📊 Star History
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/88lin/workbuddy-auto-signin/star-history/assets/my-star-history/star-history-dark.svg">
+  <img alt="Star History" src="https://raw.githubusercontent.com/88lin/workbuddy-auto-signin/star-history/assets/my-star-history/star-history-light.svg">
+</picture>
 
 ---
 
