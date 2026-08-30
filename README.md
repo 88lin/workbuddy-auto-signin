@@ -18,20 +18,6 @@
 
 ---
 
-## 🚀 一键使用（推荐）
-
-不用手动配置——直接把仓库链接发给有本地执行能力的 AI 助手（如 **WorkBuddy**），让它帮你跑起来并设置每日定时签到。把下面这段原样发过去即可：
-
-```text
-帮我把这个仓库的签到脚本跑起来，并设置每天 00:05 自动签到：
-https://github.com/88lin/workbuddy-auto-signin
-```
-
-> [!TIP]
-> 一键方式依赖 AI 能访问你本机（运行 Python、读取桌面端登录态）。WorkBuddy 自身就具备这个能力；纯云端 AI（如网页版 ChatGPT）无法直接执行，但可指导你手动操作（见下方 🛠️ 手动使用）。
-
----
-
 ## ✨ 特性
 
 | | |
@@ -48,20 +34,6 @@ https://github.com/88lin/workbuddy-auto-signin
 
 ---
 
-## ⚙️ 工作原理
-
-登录后，WorkBuddy 桌面端写出明文 JSON 会话文件 `workbuddy-desktop.info`（含 `accessToken`）。脚本流程：
-
-1. 📂 **定位**凭据文件（自动探测，或用 `WORKBUDDY_AUTH_FILE` 覆盖）
-2. 🔍 **查询** `POST /v2/billing/meter/checkin-activity-status` — 今天是否已领？
-3. 🎁 **领取** 若未领，`POST /v2/billing/meter/daily-checkin`
-4. 📤 **输出** 一行 JSON，`report` 字段是人话汇报
-
-> [!NOTE]
-> 所有请求都打到官方客户端用的同一个 endpoint（`https://copilot.tencent.com`）。签到接口系从桌面端 `app.asar` 逆向得到，仅供个人自动化使用。
-
----
-
 ## 📋 前置条件
 
 - ✅ 已安装并**登录过 WorkBuddy 桌面端**（登录后自动写出凭据文件）
@@ -69,13 +41,20 @@ https://github.com/88lin/workbuddy-auto-signin
 
 ---
 
-## 🛠️ 手动使用
+## 🚀 快速开始
+
+Clone 下来跑一次，确认能通：
 
 ```bash
 git clone https://github.com/88lin/workbuddy-auto-signin.git
 cd workbuddy-auto-signin
 python signin.py auto
 ```
+
+看到 `今日已签过` 或 `成功领取 N 积分` 就说明通了。
+
+<details>
+<summary>📖 全部命令</summary>
 
 ```
 python signin.py auto     # 签到 + 成长中心（领旅行礼物/派Buddy/开盲盒/领任务奖）
@@ -86,7 +65,7 @@ python signin.py claim    # 仅领取签到（调试，幂等）
 python signin.py all      # 查签到状态 + 领取（调试）
 ```
 
-看到 `今日已签过` 或 `成功领取 N 积分` 就说明通了。
+</details>
 
 ---
 
@@ -124,6 +103,10 @@ python signin.py all      # 查签到状态 + 领取（调试）
      把命令输出的 JSON 里 report 字段的内容，直接一句话汇报给我。
      若 report 含"领取失败"或"登录态已失效"，提醒我重新登录 WorkBuddy 桌面端。
      ```
+
+> [!TIP]
+> **懒人一键**：直接把仓库链接发给 WorkBuddy，让它帮你跑起来并设置定时——
+> `帮我把这个仓库跑起来并设置每天 00:05 自动签到：https://github.com/88lin/workbuddy-auto-signin`
 
 > [!NOTE]
 > 模式 A 每次运行会消耗一次 AI 模型调用并产生一条聊天记录。签到逻辑本身是确定性代码，模型仅负责"跑命令 + 汇报"。
@@ -173,6 +156,21 @@ Unregister-ScheduledTask -TaskName "WorkBuddyAutoSignin" -Confirm:$false
 
 > [!TIP]
 > 模式 B 的 `silent` 参数让脚本把结果写入 `signin.log` 而非 stdout，配合 `pythonw.exe`（无控制台窗口）实现完全静默。日志文件路径可用环境变量 `WORKBUDDY_SIGNIN_LOG` 覆盖。
+
+---
+
+## ⚙️ 工作原理
+
+登录后，WorkBuddy 桌面端写出明文 JSON 会话文件 `workbuddy-desktop.info`（含 `accessToken`）。脚本流程：
+
+1. 📂 **定位**凭据文件（自动探测，或用 `WORKBUDDY_AUTH_FILE` 覆盖）
+2. 🔍 **查询** `POST /v2/billing/meter/checkin-activity-status` — 今天是否已领？
+3. 🎁 **领取** 若未领，`POST /v2/billing/meter/daily-checkin`
+4. 🐱 **成长中心** 领 Buddy 旅行礼物 → 派 Buddy 出发 → 开盲盒 → 领任务奖励
+5. 📤 **输出** 一行 JSON，`report` 字段是人话汇报
+
+> [!NOTE]
+> 所有请求都打到官方客户端用的同一个 endpoint（`https://copilot.tencent.com`）。签到接口系从桌面端 `app.asar` 逆向得到，仅供个人自动化使用。
 
 ---
 
