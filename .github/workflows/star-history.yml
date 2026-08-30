@@ -1,0 +1,19 @@
+name: Star History
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'  # 每周一 00:00 UTC
+  workflow_dispatch:      # 支持手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  star-history:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: carsteneu/mystarhistory@v1
+        with:
+          repos: ${{ github.repository }}
+          token: ${{ secrets.STAR_HISTORY_TOKEN }}
