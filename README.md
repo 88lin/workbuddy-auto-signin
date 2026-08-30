@@ -40,6 +40,7 @@ https://github.com/88lin/workbuddy-auto-signin
 | 📦 | **单文件** — 完全自包含 |
 | 🔁 | **幂等安全** — 先查状态，未签才领；重复运行不会多领 |
 | 🐱 | **成长中心** — 自动领 Buddy 旅行礼物、派 Buddy 出发、开盲盒、领任务奖励 |
+| ⏰ | **双定时模式** — AI 自动化（跨平台）或系统级静默（Win，零 token） |
 | 🧠 | **智能汇报** — 一行 JSON，如 `成功领取 100 积分（连续 7 天，累计 700 积分）` |
 | 🛡️ | **健壮** — 兼容"已签"两种返回形态、识别 401/403 登录态过期、识别非签到季 |
 | 🌐 | **跨平台** — 自动探测 Windows / macOS / Linux 凭据文件 |
@@ -77,7 +78,8 @@ python signin.py auto
 ```
 
 ```
-python signin.py auto     # 每日自动化：签到 + 成长中心（领旅行礼物/派Buddy/开盲盒/领任务奖）
+python signin.py auto     # 签到 + 成长中心（领旅行礼物/派Buddy/开盲盒/领任务奖）
+python signin.py silent   # 同 auto，但输出写入日志文件而非 stdout（配合定时任务静默运行）
 python signin.py growth   # 仅成长中心（不签到）
 python signin.py status   # 仅查签到状态（调试）
 python signin.py claim    # 仅领取签到（调试，幂等）
@@ -88,9 +90,29 @@ python signin.py all      # 查签到状态 + 领取（调试）
 
 ---
 
-## ⏰ 每日定时（00:05）
+## ⏰ 每日定时自动化
 
-推荐用 **WorkBuddy 定时自动化**。本脚本依赖本机桌面端登录态，云端 CI（如 GitHub Actions）跑不了。
+本脚本依赖本机桌面端登录态，云端 CI（如 GitHub Actions）跑不了。提供**两种定时模式**，按需选择：
+
+### 模式对比
+
+| | 模式 A：AI 自动化 | 模式 B：系统级静默 |
+|:---:|---|---|
+| **平台** | 🌐 Win / macOS / Linux | 🪟 仅 Windows |
+| **原理** | WorkBuddy 自动化触发 → AI 模型跑脚本 → 模型汇报 | Windows 任务计划程序 → `pythonw.exe` 直接跑脚本 → 写日志文件 |
+| **Token 消耗** | 每次一次模型调用 | **零** |
+| **聊天记录** | 每次一条 | **零** |
+| **弹窗** | 无 | 无 |
+| **可靠性** | 依赖模型可用性 | 纯系统级，更可靠 |
+| **日志** | 在聊天记录里 | 独立日志文件 `signin.log` |
+| **关机错过** | 错过就错过 | 可设"错过后下次启动时补跑" |
+| **设置难度** | 低（在 WorkBuddy 里建自动化） | 中（一条 PowerShell 命令） |
+
+---
+
+### 模式 A：AI 自动化（跨平台）
+
+在 WorkBuddy 里新建自动化：
 
 1. 把 `signin.py` 放到固定位置，例如 `<工作区>/.workbuddy/automations/daily-signin/signin.py`
 2. 新建 WorkBuddy 自动化：
@@ -103,6 +125,55 @@ python signin.py all      # 查签到状态 + 领取（调试）
      若 report 含"领取失败"或"登录态已失效"，提醒我重新登录 WorkBuddy 桌面端。
      ```
 
+> [!NOTE]
+> 模式 A 每次运行会消耗一次 AI 模型调用并产生一条聊天记录。签到逻辑本身是确定性代码，模型仅负责"跑命令 + 汇报"。
+
+---
+
+### 模式 B：系统级静默（Windows，推荐）
+
+用 Windows 自带的任务计划程序 + `pythonw.exe`（无窗口 Python）直接运行脚本，**完全不经过 AI 模型**。
+
+**一键设置**（以管理员或普通 PowerShell 运行）：
+
+```powershell
+$pythonw = "C:\Users\<你>\.workbuddy\binaries\python\versions\3.13.12\pythonw.exe"
+$signin  = "C:\Users\<你>\Desktop\workbuddy-auto-signin\signin.py"
+
+# 创建定时任务：每天 00:05 静默运行，错过后下次启动时补跑
+$action   = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$signin`" silent"
+$trigger  = New-ScheduledTaskTrigger -Daily -At "00:05"
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -Hidden `
+            -DontStopIfGoingOnBatteries -AllowStartIfOnBatteries `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
+
+Register-ScheduledTask -TaskName "WorkBuddyAutoSignin" `
+    -Action $action -Trigger $trigger -Settings $settings -Principal $principal `
+    -Description "WorkBuddy daily auto signin (silent, zero token)"
+```
+
+**查看日志**：
+
+```bash
+tail -5 signin.log   # 或用记事本打开
+```
+
+日志格式（每行一条 JSON）：
+
+```
+[2026-08-30 10:34:04] {"result": "ALREADY", "report": "今日已签过（今日 +100，连续 16 天，累计 1600 积分）", ...}
+```
+
+**卸载定时任务**：
+
+```powershell
+Unregister-ScheduledTask -TaskName "WorkBuddyAutoSignin" -Confirm:$false
+```
+
+> [!TIP]
+> 模式 B 的 `silent` 参数让脚本把结果写入 `signin.log` 而非 stdout，配合 `pythonw.exe`（无控制台窗口）实现完全静默。日志文件路径可用环境变量 `WORKBUDDY_SIGNIN_LOG` 覆盖。
+
 ---
 
 ## 🔧 配置
@@ -110,6 +181,7 @@ python signin.py all      # 查签到状态 + 领取（调试）
 | 环境变量 | 作用 |
 |---|---|
 | `WORKBUDDY_AUTH_FILE` | 自动探测失败时，手动指定凭据文件路径 |
+| `WORKBUDDY_SIGNIN_LOG` | `silent` 模式下日志文件路径（默认 `signin.log`） |
 
 ---
 

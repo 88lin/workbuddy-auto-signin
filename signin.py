@@ -16,6 +16,7 @@ WORKBUDDY_AUTH_FILE 指定。任何模式下都不会打印令牌，可安全分
 
 用法：
   python signin.py auto     # 每日自动化：签到 + 成长中心（领旅行礼物/派Buddy/开盲盒/领任务奖）
+  python signin.py silent   # 同 auto，但结果写日志文件而非 stdout（配合 pythonw.exe 静默运行）
   python signin.py growth   # 仅成长中心（不签到）
   python signin.py status   # 仅查签到状态（调试）
   python signin.py claim    # 仅领取签到（调试，幂等）
@@ -359,14 +360,25 @@ def main():
     headers = build_headers(session)
     endpoint = ((session.get("auth") or {}).get("endpoint") or DEFAULT_ENDPOINT).rstrip("/")
 
-    if action == "auto":
+    if action in ("auto", "silent"):
         code, out = run_auto(headers, endpoint)
         # 签到后顺带跑成长中心
         gcode, gout = run_growth(headers, endpoint)
         out["growth"] = gout.get("report")
         if gout.get("credits_gained"):
             out["report"] += "；" + gout["report"]
-        print(json.dumps(out, ensure_ascii=False))
+
+        if action == "silent":
+            # 写日志文件（配合 pythonw.exe 无窗口运行，不输出 stdout）
+            log_path = os.environ.get("WORKBUDDY_SIGNIN_LOG")
+            if not log_path:
+                log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "signin.log")
+            from datetime import datetime
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(log_path, "a", encoding="utf-8") as lf:
+                lf.write("[%s] %s\n" % (ts, json.dumps(out, ensure_ascii=False)))
+        else:
+            print(json.dumps(out, ensure_ascii=False))
         return code
 
     if action == "growth":
