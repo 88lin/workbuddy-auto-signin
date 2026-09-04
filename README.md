@@ -1,16 +1,17 @@
 <div align="center">
 
+<img src="assets/cover.jpg" alt="workbuddy-auto-signin — WorkBuddy 自动签到脚本" width="100%">
+
 # 🤖 workbuddy-auto-signin
 
 **自动领取 WorkBuddy 每日签到积分的小脚本**
 
-零依赖 · 纯标准库 · 跨平台 · 幂等安全
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python 3](https://img.shields.io/badge/Python-3.x-blue.svg)](https://www.python.org/)
-[![No Dependencies](https://img.shields.io/badge/dependencies-0-green.svg)]()
-[![Platform](https://img.shields.io/badge/platform-Win%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)]()
-[![Stars](https://img.shields.io/github/stars/88lin/workbuddy-auto-signin.svg)](https://github.com/88lin/workbuddy-auto-signin)
+[![Release](https://img.shields.io/github/v/release/88lin/workbuddy-auto-signin?style=for-the-badge&logo=github&logoColor=white&label=%E7%89%88%E6%9C%AC&color=0A84FF)](https://github.com/88lin/workbuddy-auto-signin/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-0098D4?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](LICENSE)
+[![Python 3](https://img.shields.io/badge/Python-3.x-3670A0?style=for-the-badge&logo=python&logoColor=ffdd54)](https://www.python.org/)
+[![Dependencies](https://img.shields.io/badge/Dependencies-0-2BB673?style=for-the-badge&logo=pypi&logoColor=white)]()
+[![Platform](https://img.shields.io/badge/Platform-Win%20%7C%20macOS%20%7C%20Linux-7C3AED?style=for-the-badge)]()
+[![Stars](https://img.shields.io/github/stars/88lin/workbuddy-auto-signin?style=for-the-badge&logo=github&logoColor=white&color=F59E0B)](https://github.com/88lin/workbuddy-auto-signin/stargazers)
 
 </div>
 
