@@ -212,6 +212,9 @@ python signin.py all      # 查签到状态 + 领取（调试）
 5. 📤 **输出** 一行 JSON，`report` 字段是人话汇报
 
 > [!NOTE]
+> 网络失败（GET 请求）自动重试 1 次；抽奖、领奖等写操作**不**重试，避免超时发生在服务端处理完成之后造成重复提交。两个签到接口例外——状态查询是只读的，领取接口本身幂等（见上文响应契约），故允许重试。整个运行受时间预算约束，详见「配置」。
+
+> [!NOTE]
 > 所有请求都打到官方客户端用的同一个 endpoint（`https://copilot.tencent.com`）。签到接口系从桌面端 `app.asar` 逆向得到，仅供个人自动化使用。
 
 ---
@@ -222,6 +225,12 @@ python signin.py all      # 查签到状态 + 领取（调试）
 |---|---|
 | `WORKBUDDY_AUTH_FILE` | 自动探测失败时，手动指定凭据文件路径 |
 | `WORKBUDDY_SIGNIN_LOG` | `silent` 模式下日志文件路径（默认 `signin.log`） |
+| `WORKBUDDY_BUDGET_SECONDS` | 单次运行的网络请求时间预算，默认 `420`（7 分钟）。**须为正数且小于定时任务的 `ExecutionTimeLimit`**，上限 `540`。非法值、`≤0` 或超上限都会夹到安全值，并在输出里附 `config_warning` |
+
+> [!NOTE]
+> 时间预算须小于计划任务的 `ExecutionTimeLimit`（配置为 10 分钟）。网络异常时单个请求最坏要耗 30 秒，若不设上限，接口逐个超时会把任务跑穿被系统强杀——而结果是在最后才写日志的，当天记录会整条丢失。预算耗尽时脚本主动收尾并如实记录，剩余项留到下次。
+>
+> 若你要把 `ExecutionTimeLimit` 调到 10 分钟以上并相应放大预算，还需同步改 `signin.py` 里的 `MAX_BUDGET_SECONDS`（默认 `540`，即 PT10M 留 60 秒余量）；调小时同理。
 
 ---
 
@@ -230,8 +239,13 @@ python signin.py all      # 查签到状态 + 领取（调试）
 | 现象 | 处理 |
 |---|---|
 | `NO_AUTH / 未找到登录凭据` | 先登录一次 WorkBuddy 桌面端；或设置 `WORKBUDDY_AUTH_FILE` |
+| `NO_AUTH / WORKBUDDY_AUTH_FILE 指向的文件不存在` | 环境变量路径写错了——核对 `looked_in` 字段里的实际路径 |
 | `NO_SESSION / HTTP 401\|403` | 登录态过期——重新登录桌面端，自动化自动恢复 |
 | `INACTIVE / 签到活动未开启` | 非签到季，属正常，无需处理 |
+| `NETWORK / 网络不可达` | 断网或服务端不可用，**非**登录问题。GET 请求会自动重试 1 次；下次运行自动重试 |
+| `TIMEOUT / 已达本次运行时间预算` | 网络严重超时导致预算耗尽，已领到的部分照常记录，剩余项下次再领 |
+| `ERROR / 登录凭据文件不是合法 JSON` | 本地凭据文件损坏——重新登录一次 WorkBuddy 桌面端即可重建 |
+| `ERROR / 脚本运行异常（...）` | 异常不会静默丢失：silent 模式会写进 `signin.log`；可重跑 `python signin.py status` 看原始返回 |
 | 调试原始返回 | `python signin.py status` 或 `python signin.py all` |
 
 > [!IMPORTANT]
