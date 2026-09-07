@@ -367,7 +367,18 @@ def main():
         out = {"result": "NO_SESSION", "report": str(e)}
         print(json.dumps(out, ensure_ascii=False))
         return 1
-    endpoint = ((session.get("auth") or {}).get("endpoint") or DEFAULT_ENDPOINT).rstrip("/")
+    auth_meta = session.get("auth") or {}
+    endpoint = (auth_meta.get("endpoint") or "").rstrip("/")
+    if not endpoint:
+        # Global accounts (workbuddy.ai) export auth files that carry domain
+        # but no endpoint key — derive the endpoint from the domain before
+        # falling back to the CN default, otherwise requests for a Global
+        # token would hit copilot.tencent.com and fail with 401.
+        domain = (auth_meta.get("domain") or "").strip()
+        if domain:
+            endpoint = ("https://" + domain.lstrip("./")).rstrip("/")
+        else:
+            endpoint = DEFAULT_ENDPOINT
 
     if action in ("auto", "silent"):
         code, out = run_auto(headers, endpoint)
