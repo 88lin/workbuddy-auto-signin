@@ -61,7 +61,7 @@
 | 🧩 | **零依赖** — 纯 Python 标准库，不用 `pip install`，任意 Python 3 即可 |
 | 📦 | **单文件** — 完全自包含 |
 | 🔁 | **幂等安全** — 先查状态，未签才领；重复运行不会多领 |
-| 🐱 | **成长中心** — 自动领旅行礼物、派 Buddy、领任务奖、连登奖励兑换、开盲盒抽奖、能量开 Buddy 盲盒 |
+| 🐱 | **成长中心** — 自动领旅行礼物、派 Buddy、领取新任务、领任务奖、断登自动补登、连登奖励兑换、开盲盒抽奖、能量开 Buddy 盲盒 |
 | 🐾 | **成长中心轮询** — 一键安装自带：Buddy 一回来就领礼物并补派，把每日名额用满，不让礼物压到第二天 |
 | ⏰ | **双定时模式** — AI 自动化（跨平台）或系统级静默（Win，零 token） |
 | 🧠 | **智能汇报** — 一行 JSON，如 `成功领取 100 积分（连续 7 天，累计 700 积分）` |
@@ -165,7 +165,7 @@ powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 | 任务 | 频率 | 干什么 |
 |---|---|---|
 | `WorkBuddyAutoSignin` | 每天 00:05 | 签到 + 成长中心，静默写 `signin.log` |
-| `WorkBuddyGrowthPoll` | 每 4 小时 | 只跑成长中心：领旅行礼物、派 Buddy |
+| `WorkBuddyGrowthPoll` | 每 4 小时 | 只跑成长中心：领礼物、派 Buddy、兑换、抽奖等全套 |
 
 两个任务都零 Token、无窗口、关机错过后下次开机自动补跑。装完终端会打印结果和下次运行时间。
 
@@ -230,7 +230,7 @@ python signin.py auto
 <summary>📖 全部命令</summary>
 
 ```
-python signin.py auto           # 签到 + 成长中心（领礼物 / 派 Buddy / 领任务奖 / 连登兑换 / 抽奖 / 开 Buddy）
+python signin.py auto           # 签到 + 成长中心（礼物 / 任务 / 补登 / 连登兑换 / 抽奖 / Buddy）
 python signin.py silent         # 同 auto，但输出写入日志文件而非 stdout（配合定时任务静默运行）
 python signin.py growth         # 仅成长中心（不签到）
 python signin.py silent-growth  # 仅成长中心 + 写日志文件（配合模式 B 的成长中心轮询任务）
@@ -250,7 +250,7 @@ python signin.py all            # 查签到状态 + 领取（调试）
 1. 📂 **定位**凭据文件（自动探测，或用 `WORKBUDDY_AUTH_FILE` 覆盖）
 2. 🔍 **查询** `POST /v2/billing/meter/checkin-activity-status` — 今天是否已领？
 3. 🎁 **领取** 若未领，`POST /v2/billing/meter/daily-checkin`
-4. 🐱 **成长中心** 领旅行礼物 → 派 Buddy → 领任务奖 → 连登奖励兑换 → 开盲盒 → 能量开 Buddy 盲盒
+4. 🐱 **成长中心** 领旅行礼物 → 派 Buddy → 领取新任务（进度从领取才开始计）→ 领任务奖 → 断登自动补登（有补登卡时，每轮最多补一天）→ 连登奖励兑换 → 开盲盒 → 能量开 Buddy 盲盒
 5. 📤 **输出** 一行 JSON，`report` 字段是人话汇报
 
 > [!NOTE]
@@ -267,13 +267,13 @@ python signin.py all            # 查签到状态 + 领取（调试）
 |---|---|
 | `WORKBUDDY_AUTH_FILE` | 自动探测失败时，手动指定凭据文件路径 |
 | `WORKBUDDY_SIGNIN_LOG` | `silent` 模式下日志文件路径（默认 `signin.log`） |
-| `WORKBUDDY_BUDGET_SECONDS` | 单次运行的网络请求时间预算，默认 `420`（7 分钟）；`silent-growth` 轮询收紧为 `120`。**须为正数且小于定时任务的 `ExecutionTimeLimit`**，上限 `540`。非法值、`≤0` 或超上限都会夹到安全值，并在输出里附 `config_warning` |
+| `WORKBUDDY_BUDGET_SECONDS` | 单次运行的网络请求时间预算。签到类命令默认 `420`（7 分钟）、上限 `540`；`silent-growth` 轮询默认 `120`、上限 `240`。**须为正数且小于对应定时任务的 `ExecutionTimeLimit`**。非法值、`≤0` 或超上限都会夹到安全值，并在输出里附 `config_warning` |
 | `WORKBUDDY_GROWTH_LOG_EMPTY` | 设为 `1`（或 `true`/`yes`/`on`）时，`silent-growth` 连空跑也写日志；默认只在领到东西或出错时记录 |
 
 > [!NOTE]
-> 时间预算须小于计划任务的 `ExecutionTimeLimit`（配置为 10 分钟）。网络异常时单个请求最坏要耗 30 秒，若不设上限，接口逐个超时会把任务跑穿被系统强杀——而结果是在最后才写日志的，当天记录会整条丢失。预算耗尽时脚本主动收尾并如实记录，剩余项留到下次。
+> 时间预算须小于计划任务的 `ExecutionTimeLimit`。两个任务的时限不同，所以上限也分开算：签到任务 PT10M → 上限 `540`，轮询任务 PT5M → 上限 `240`，各留 60 秒给解释器启动和收尾。网络异常时单个请求最坏要耗 30 秒，若不设上限，接口逐个超时会把任务跑穿被系统强杀——而结果是在最后才写日志的，当天记录会整条丢失。预算耗尽时脚本主动收尾并如实记录，剩余项留到下次。
 >
-> 若你要把 `ExecutionTimeLimit` 调到 10 分钟以上并相应放大预算，还需同步改 `signin.py` 里的 `MAX_BUDGET_SECONDS`（默认 `540`，即 PT10M 留 60 秒余量）；调小时同理。
+> 若你要调整某个任务的 `ExecutionTimeLimit`，须同步改 `signin.py` 顶部对应的 `MAX_BUDGET_SECONDS` / `POLL_MAX_BUDGET_SECONDS`（分别对应签到任务与轮询任务）。
 
 ---
 

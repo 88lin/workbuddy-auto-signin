@@ -15,15 +15,17 @@
 WORKBUDDY_AUTH_FILE 指定。任何模式下都不会打印令牌，可安全分享。
 
 用法：
-  python signin.py auto     # 每日自动化：签到 + 成长中心（领旅行礼物/派Buddy/开盲盒/领任务奖）
-  python signin.py silent   # 同 auto，但结果写日志文件而非 stdout（配合 pythonw.exe 静默运行）
-  python signin.py growth   # 仅成长中心（不签到）
-  python signin.py status   # 仅查签到状态（调试）
-  python signin.py claim    # 仅领取签到（调试，幂等）
-  python signin.py all      # 查签到状态 + 领取（调试）
+  python signin.py auto           # 每日自动化：签到 + 成长中心（礼物/任务/补登/兑换/抽奖/Buddy）
+  python signin.py silent         # 同 auto，但结果写日志文件而非 stdout（配合 pythonw.exe 静默运行）
+  python signin.py growth         # 仅成长中心（不签到）
+  python signin.py silent-growth  # 仅成长中心 + 写日志文件（配合成长中心轮询任务）
+  python signin.py status         # 仅查签到状态（调试）
+  python signin.py claim          # 仅领取签到（调试，幂等）
+  python signin.py all            # 查签到状态 + 领取（调试）
 """
 
 import json
+import math
 import os
 import ssl
 import sys
@@ -40,26 +42,33 @@ AUTH_BASENAME = os.path.join("CodeBuddyExtension", "Data", "Public", "auth", "wo
 CODE_NO_NETWORK = -1   # 连不上/超时
 CODE_BUDGET_OUT = -2   # 本次运行的时间预算已耗尽，主动放弃后续请求
 
-# 计划任务的 ExecutionTimeLimit 是 PT10M；跑满会被系统直接杀掉，届时 emit 还没执行，
-# 当天日志整条丢失。这里自设更小的预算，确保总能走到写日志那一步。
-# MAX_BUDGET_SECONDS 必须与 README 里那条 ExecutionTimeLimit 保持一致（PT10M = 600s，
-# 留 60s 给解释器启动和收尾）；若你把定时任务的时限调大，这两处要一起改。
+# 计划任务跑满 ExecutionTimeLimit 会被系统直接杀掉，届时 emit 还没执行，当天日志整条
+# 丢失。这里自设更小的预算，确保总能走到写日志那一步。两个任务的时限不同，上限也必须
+# 分开算：签到任务 PT10M、轮询任务 PT5M，各留 60s 给解释器启动和收尾。
+# 这四个常量与 install-windows.ps1 里的 ExecutionTimeLimit 一一对应，改一处就要改另一处。
 DEFAULT_BUDGET_SECONDS = 420.0
-MAX_BUDGET_SECONDS = 540.0
+MAX_BUDGET_SECONDS = 540.0          # 签到任务 PT10M = 600s - 60s
 # 成长中心轮询一天要跑好几次，单次预算相应收紧：它几乎没有必须完成的任务，
 # 与其让它占满 7 分钟，不如早失败、下次再试。
 POLL_BUDGET_SECONDS = 120.0
+POLL_MAX_BUDGET_SECONDS = 240.0     # 轮询任务 PT5M = 300s - 60s
+# 每轮最多用掉几张补登卡。卡是稀缺资源（上限 4 张），而这条写路径还没被真实响应
+# 验证过，一轮只花一张：猜错形状也只错一次，一天 6 轮照样能把断登补完。
+MAKEUP_MAX_PER_RUN = 1
 REQUEST_TIMEOUT = 30
 _started_at = None
 _budget_seconds = DEFAULT_BUDGET_SECONDS
 _config_warning = None   # 配置非法时的告警，由 emit 统一带进输出
 
 
-def _parse_budget(default=DEFAULT_BUDGET_SECONDS):
+def _parse_budget(default=DEFAULT_BUDGET_SECONDS, maximum=MAX_BUDGET_SECONDS):
     """解析预算环境变量。非法值/越界值一律夹到安全区间——绝不能在这里抛异常。
 
     这段逻辑曾写在模块顶层，WORKBUDDY_BUDGET_SECONDS=abc 会让进程在 main() 的
     try/except 生效之前就崩掉，silent 模式下当天日志整条为空。
+
+    上限按调用方传入的 maximum 算：轮询任务的 ExecutionTimeLimit 比签到任务短，
+    共用一个 540s 的上限等于对轮询任务没有上限，跑穿一样会被杀在写日志之前。
     """
     raw = os.environ.get("WORKBUDDY_BUDGET_SECONDS")
     if not raw:
@@ -73,22 +82,26 @@ def _parse_budget(default=DEFAULT_BUDGET_SECONDS):
         # "0" 是非空字符串，用 `or` 兜不住；且 0 会让每个请求都直接放弃，脚本永久失效
         return default, "WORKBUDDY_BUDGET_SECONDS=%s 必须为正数，已回落 %s 秒" % (
             raw, int(default))
-    if val > MAX_BUDGET_SECONDS:
+    if val > maximum:
         # 上限同样是硬要求：预算大于任务时限就等于没有预算，黑洞式超时会把进程跑到被强杀
-        return MAX_BUDGET_SECONDS, ("WORKBUDDY_BUDGET_SECONDS=%s 超过上限，已夹到 %s 秒"
-                                    "（须小于定时任务的 ExecutionTimeLimit）") % (
-            raw, int(MAX_BUDGET_SECONDS))
+        return maximum, ("WORKBUDDY_BUDGET_SECONDS=%s 超过本命令上限，已夹到 %s 秒"
+                         "（须小于该定时任务的 ExecutionTimeLimit）") % (
+            raw, int(maximum))
     return val, None
 
 
 def _start_budget(action=None):
     """启动预算时钟；配置非法时记下告警，由 emit 带进输出而不是静默回落。
 
-    轮询类命令（silent-growth）用更短的默认值，用户显式设置环境变量时仍以环境变量为准。
+    轮询类命令（silent-growth）用更短的默认值和更低的上限，用户显式设置环境变量时
+    仍以环境变量为准，但同样夹在该命令自己的上限内。
     """
     global _started_at, _budget_seconds, _config_warning
-    default = POLL_BUDGET_SECONDS if action == "silent-growth" else DEFAULT_BUDGET_SECONDS
-    _budget_seconds, _config_warning = _parse_budget(default)
+    if action == "silent-growth":
+        default, maximum = POLL_BUDGET_SECONDS, POLL_MAX_BUDGET_SECONDS
+    else:
+        default, maximum = DEFAULT_BUDGET_SECONDS, MAX_BUDGET_SECONDS
+    _budget_seconds, _config_warning = _parse_budget(default, maximum)
     _started_at = time.monotonic()
 
 
@@ -277,15 +290,21 @@ def _fmt_eta(arrive_at, server_now):
     """把服务端返回的 Unix 时间戳换算成"还有多久回来"。
 
     任一时间戳缺失/非法就返回空串——这是纯展示信息，绝不能因为它让整轮执行失败。
+    json.loads 默认接受 Infinity/NaN，非有限值同样按缺失处理，否则会汇报出
+    "约 inf 小时后回"这种话。
     """
     try:
         left = float(arrive_at) - float(server_now)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if not math.isfinite(left):
         return ""
     if left <= 0:
         return "，已到达待领取"
-    if left < 3600:
-        return "，约 %d 分钟后回" % max(1, int(round(left / 60.0)))
+    # 先算分钟再决定用哪个量纲：直接按 left < 3600 分档会让 3599s 显示成"约 60 分钟"
+    minutes = int(round(left / 60.0))
+    if minutes < 60:
+        return "，约 %d 分钟后回" % max(1, minutes)
     return "，约 %.1f 小时后回" % (left / 3600.0)
 
 
@@ -335,17 +354,21 @@ def _dumps(out):
 
 
 def emit(out, action):
-    """silent 模式写日志文件，其余模式打印到 stdout；本函数保证不抛异常。
+    """silent 类模式写日志文件，其余模式打印到 stdout；本函数保证不抛异常。
+
+    判定用前缀而不是等号：silent-growth 同样是无窗口跑的，pythonw 下 sys.stdout 是
+    None，print 会静默成功（不抛异常），于是"打到 stdout"等于扔进黑洞——NO_AUTH、
+    NO_SESSION 这类最需要人处理的结果会一条不剩地消失。
 
     ERROR 两条通道都走：计划任务里若把命令名写错（silent 拼成 slient 之类），
-    走 stdout 就等于扔进黑洞，无窗口运行下这次失败再没有任何痕迹——
-    正是本脚本想杜绝的"当天日志整条丢失"。
+    action 不带 silent 前缀，走 stdout 就等于扔进黑洞，无窗口运行下这次失败再没有
+    任何痕迹——正是本脚本想杜绝的"当天日志整条丢失"。
     """
     if _config_warning and isinstance(out, dict):
         out = dict(out, config_warning=_config_warning)
     payload = _dumps(out)
     is_error = isinstance(out, dict) and out.get("result") == "ERROR"
-    if action != "silent":
+    if not str(action).startswith("silent"):
         try:
             print(payload)
             if not is_error:
@@ -404,7 +427,7 @@ def _already_report(status, via=None):
 
 
 def run_growth(headers, endpoint):
-    """成长中心自动化：领旅行礼物→派 Buddy 出发→领任务奖→连登奖励兑换→开盲盒→能量开 Buddy→汇报。
+    """成长中心自动化：领旅行礼物→派 Buddy→领任务/领取新任务→补登→连登兑换→开盲盒→能量开 Buddy→汇报。
 
     各子步骤单独 try，一段失败不影响其余领取；任一步遇 401/403 直接升级为 NO_SESSION。
     """
@@ -515,22 +538,49 @@ def run_growth(headers, endpoint):
                         parts.append("时间预算耗尽，剩余任务下次再领")
                         break
                     try:
+                        # accept_status 三态：None/"" 未领取 · "accepted" 已领取进行中 · "claimed" 已领奖。
+                        # 官方规则：进度从"领取任务"那一刻才开始计，领取前的使用行为不算。
+                        # 所以除了领奖，还得替用户把新出现的任务领下来，否则它永远完不成。
+                        status = t.get("accept_status")
+                        if status == "claimed" or t.get("locked"):
+                            continue
                         prog = t.get("progress") or {}
                         target = as_int(prog.get("target"), 1) or 1  # target 为 0/缺失时按 1 处理，避免误判已完成
                         done = as_int(prog.get("current")) >= target
-                        if done and t.get("accept_status") != "claimed" and t.get("has_reward"):
-                            acode, abody = post(base + "/tasks/accept", headers,
-                                                {"task_code": t.get("task_code")})
-                            if _check_auth(acode):
-                                return 1, {"result": "NO_SESSION",
-                                           "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
-                            if 200 <= acode < 300:
+                        if not done and status:
+                            continue  # 已领取、还没做完——等用户完成，别重复领取
+                        # claiming=True 才是"领奖"：已领取过 + 已完成。未领取的任务即使
+                        # 进度显示已达标也只当"领取"，因为这一 POST 大概率只是接单而非发奖，
+                        # 按领奖上报会把没到账的积分算进 credits_gained；下一轮再正常领奖。
+                        claiming = bool(done and status)
+                        # has_reward 只在领奖时作为前置条件。它若表示"有待领取的奖励"，
+                        # 新任务上必然为假，用它拦截接单会让"自动领取新任务"永不触发。
+                        if claiming and not t.get("has_reward"):
+                            continue
+                        acode, abody = post(base + "/tasks/accept", headers,
+                                            {"task_code": t.get("task_code")})
+                        if _check_auth(acode):
+                            return 1, {"result": "NO_SESSION",
+                                       "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
+                        title = t.get("title", t.get("task_code"))
+                        if 200 <= acode < 300:
+                            if claiming:
                                 rc = as_int(t.get("reward_credit"))
                                 re_ = as_int(t.get("reward_energy"))
                                 credits_gained += rc
-                                parts.append("领任务奖「%s」+credit%s+energy%s" % (
-                                    t.get("title", t.get("task_code")), rc, re_))
-                                successes += 1
+                                parts.append("领任务奖「%s」+credit%s+energy%s" % (title, rc, re_))
+                            else:
+                                parts.append("领取任务「%s」（进度开始计）" % title)
+                            successes += 1
+                        else:
+                            # 失败必须记：这个 POST 现在每轮都会为未领取的任务发一次，
+                            # 静默吞掉就等于接口坏了也没人知道（轮询下空跑是不写日志的）
+                            msg = dig(abody, "msg") or ""
+                            parts.append("%s「%s」失败：%s" % (
+                                "领任务奖" if claiming else "领取任务",
+                                title, msg or "HTTP %s" % acode))
+                            failures += 1
+                            hard_failures += _is_hard_failure(acode)
                     except Exception as e:
                         parts.append("任务「%s」异常（%s: %s）" % (
                             t.get("task_code", "?"), type(e).__name__, e))
@@ -541,7 +591,67 @@ def run_growth(headers, endpoint):
             failures += 1
             hard_failures += 1
 
-    # --- 3. 连登奖励兑换（入门/进阶/巅峰三档，附积分/能量/补登卡/抽奖机会）---
+    # --- 3. 补登卡：断登自动补一张，保住连登 ---
+    # 官方规则：补登卡上限 4 张、仅可补救当月断登；/streak 的 makeup_dates
+    # 是服务端算好的可补日期。卡攒着不花，超上限后新卡也拿不到，断登优先补。
+    # 放在连登兑换之前：补登会改变连登天数，先补，兑换才能拿到最新解锁状态。
+    # 注意：实测时 makeup_dates 一直是 []，这条写路径没有被真实响应验证过，
+    # 所以每轮最多补一张（见 MAKEUP_MAX_PER_RUN），万一形状猜错也只错一次。
+    streak_body = None    # 复用给第 7 段的展示值，避免同一轮打两次 /streak
+    streak_stale = False  # 补登成功会改变连签天数，此时必须重新取
+    if _budget_left() <= 0:
+        parts.append("时间预算耗尽，补登跳过")
+    else:
+        try:
+            mcode, mbody = get(base + "/streak", headers)
+            if _check_auth(mcode):
+                return 1, {"result": "NO_SESSION",
+                           "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
+            if 200 <= mcode < 300:
+                streak_body = mbody
+                # 余额兼容两种形状：{"makeup_cards":{"balance":2}} 与 {"makeup_cards":2}。
+                # 只认前者的话，接口是后者时整个补登会一声不响地永不执行。
+                cards_obj = dig(mbody, "makeup_cards")
+                cards = as_int(cards_obj.get("balance")) if isinstance(cards_obj, dict) \
+                    else as_int(cards_obj)
+                # 实测 makeup_dates 在 streak 对象内部（不在顶层），当前值为 []；
+                # dig 只做顶层查找，这里手动下钻，两处都兜住以防接口调整。
+                streak_obj = dig(mbody, "streak") or {}
+                dates = (streak_obj.get("makeup_dates") if isinstance(streak_obj, dict) else None) \
+                    or dig(mbody, "makeup_dates") or []
+                if cards > 0 and isinstance(dates, list) and dates:
+                    for d in dates[:min(cards, MAKEUP_MAX_PER_RUN)]:
+                        if _budget_left() <= 0:
+                            parts.append("时间预算耗尽，剩余补登下次再做")
+                            break
+                        ucode, ubody = post(base + "/makeup-cards/use", headers,
+                                            {"target_date": d, "client_token": _client_token()})
+                        if _check_auth(ucode):
+                            return 1, {"result": "NO_SESSION",
+                                       "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
+                        if 200 <= ucode < 300:
+                            cards -= 1
+                            streak_stale = True
+                            # 优先报服务端给的余额，本地递减只是接口没给时的兜底
+                            left_obj = dig(ubody, "makeup_cards")
+                            left_cards = as_int(left_obj.get("balance"), cards) \
+                                if isinstance(left_obj, dict) else as_int(left_obj, cards)
+                            parts.append("补登 %s（剩 %s 张卡）" % (d, left_cards))
+                            successes += 1
+                        else:
+                            msg = dig(ubody, "msg") or ""
+                            parts.append("补登 %s 失败：%s" % (d, msg or "HTTP %s" % ucode))
+                            failures += 1
+                            hard_failures += _is_hard_failure(ucode)
+                    if len(dates) > MAKEUP_MAX_PER_RUN and cards > 0:
+                        parts.append("另有 %s 天可补、剩 %s 张卡，下轮继续" % (
+                            len(dates) - MAKEUP_MAX_PER_RUN, cards))
+        except Exception as e:
+            parts.append("补登模块异常（%s: %s）" % (type(e).__name__, e))
+            failures += 1
+            hard_failures += 1
+
+    # --- 4. 连登奖励兑换（入门/进阶/巅峰三档，附积分/能量/补登卡/抽奖机会）---
     # 入门 7 天、进阶 14 天、巅峰 28 天解锁。summary 只报 claimed/locked 两种
     # 已见状态；"非 claimed 且非 locked"即视为可兑换去尝试，被服务端拒绝时按
     # 普通业务失败处理（不算硬失败）。
@@ -581,7 +691,7 @@ def run_growth(headers, endpoint):
             failures += 1
             hard_failures += 1
 
-    # --- 4. 盲盒/抽奖（draw 必须带 client_token，缺了会 400）---
+    # --- 5. 盲盒/抽奖（draw 必须带 client_token，缺了会 400）---
     if _budget_left() <= 0:
         parts.append("时间预算耗尽，盲盒跳过")
     else:
@@ -599,6 +709,14 @@ def run_growth(headers, endpoint):
                                "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
                 if 200 <= dcode < 300:
                     prize = dig(dbody, "prize_name") or dig(dbody, "prize") or "未知"
+                    if not isinstance(prize, str):
+                        # prize 可能是对象/数字；直接 += 会抛 TypeError，把一次已经中了的
+                        # 抽奖变成"模块异常"，奖品名和下面这句提醒双双丢失
+                        prize = str(prize)
+                    # 奖池含实物周边（冰箱贴/胸针/杯子），中奖后要用户自己去填收件信息，
+                    # 脚本代填不了也绝不该代填——但必须提醒，否则奖品会卡在未填地址状态。
+                    if dig(dbody, "need_address") or dig(dbody, "require_address"):
+                        prize += "（实物奖，需到成长中心填写收件信息）"
                     parts.append("开盲盒获得：%s" % prize)
                     successes += 1
                 else:
@@ -610,7 +728,7 @@ def run_growth(headers, endpoint):
             failures += 1
             hard_failures += 1
 
-    # --- 5. Buddy 盲盒（能量攒够 cost_per_open 就开；能量没有其它消耗出口）---
+    # --- 6. Buddy 盲盒（能量攒够 cost_per_open 就开；能量没有其它消耗出口）---
     if _budget_left() <= 0:
         parts.append("时间预算耗尽，Buddy 盲盒跳过")
     else:
@@ -624,7 +742,8 @@ def run_growth(headers, endpoint):
                 max_open = as_int(dig(qbody, "max_open_count"), 1) or 1
                 if affordable > 0:
                     count = min(affordable, max_open)
-                    ocode, obody = post(base + "/buddy/open", headers, {"count": count})
+                    ocode, obody = post(base + "/buddy/open", headers,
+                                        {"count": count, "client_token": _client_token()})
                     if _check_auth(ocode):
                         return 1, {"result": "NO_SESSION",
                                    "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
@@ -644,7 +763,7 @@ def run_growth(headers, endpoint):
             failures += 1
             hard_failures += 1
 
-    # --- 6. 能量 & 连签状态（纯展示值，预算不够就直接不取，不计失败）---
+    # --- 7. 能量 & 连签状态（纯展示值，预算不够就直接不取，不计失败）---
     energy = None
     streak_days = None
     if _budget_left() > 0:
@@ -655,14 +774,19 @@ def run_growth(headers, endpoint):
         except Exception:
             pass
 
-    if _budget_left() > 0:
-        try:
+    # 连签天数：第 3 段已经取过 /streak，没补登过就直接复用，别在同一轮里打两次同一个接口。
+    # 补登成功会改变天数（streak_stale），那时才有必要重新取。
+    try:
+        if streak_body is not None and not streak_stale:
+            streak_obj = dig(streak_body, "streak") or {}
+            streak_days = streak_obj.get("days") if isinstance(streak_obj, dict) else None
+        elif _budget_left() > 0:
             scode2, sbody2 = get(base + "/streak", headers)
             if not _check_auth(scode2):
                 streak_obj = dig(sbody2, "streak") or {}
                 streak_days = streak_obj.get("days") if isinstance(streak_obj, dict) else None
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     tail = []
     if energy is not None:
@@ -887,13 +1011,13 @@ def _run(action):
         return code
 
     if action == "silent-growth":
-        # 只跑成长中心，结果写日志文件（emit 的第二个参数必须是 silent 才落盘）。
+        # 只跑成长中心，结果写日志文件（emit 按 silent 前缀判定落盘）。
         # 不碰签到接口：签到一天一次就够，轮询没必要反复打它。
         # 空跑默认不落盘——一天要跑好几轮，全写进去只会把真正有价值的记录
         # 淹没在一串"Buddy 旅行中"里。要看完整过程就设 WORKBUDDY_GROWTH_LOG_EMPTY=1。
         code, out = run_growth(headers, endpoint)
         if (not out.get("idle")) or _env_flag("WORKBUDDY_GROWTH_LOG_EMPTY"):
-            emit(out, "silent")
+            emit(out, action)
         return code
 
     # 以下为交互式调试命令，输出原始返回。走 emit 而非 print，这样非法配置的

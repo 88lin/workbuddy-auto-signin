@@ -60,7 +60,9 @@ Write-Host ("-" * 46) -ForegroundColor DarkGray
 # --- 1. 定位 pythonw.exe ---
 Write-Host "[1/3] 定位 pythonw.exe ..." -NoNewline
 $pythonw = $ManualPythonw
-if (-not (Test-Path $pythonw)) { $pythonw = Find-Pythonw }
+# 必须先判空再 Test-Path：Test-Path "" 抛的是参数校验异常（不是返回 $false），
+# 配合顶部的 $ErrorActionPreference = "Stop"，会让脚本直接死在这一行。
+if (-not $pythonw -or -not (Test-Path $pythonw)) { $pythonw = Find-Pythonw }
 if (-not $pythonw -or -not (Test-Path $pythonw)) {
     Write-Host " 失败" -ForegroundColor Red
     Write-Host ""
@@ -73,9 +75,13 @@ Write-Host " $pythonw" -ForegroundColor Green
 # --- 2. 定位 signin.py ---
 Write-Host "[2/3] 定位 signin.py ..." -NoNewline
 $signin = $ManualSignin
-if (-not (Test-Path $signin)) { $signin = Join-Path $PSScriptRoot "signin.py" }
-if (-not (Test-Path $signin)) { $signin = Join-Path (Get-Location) "signin.py" }
-if (-not (Test-Path $signin)) {
+# 同上：$ManualSignin 默认为空串，不判空会崩在 Test-Path 的参数校验上。
+# $PSScriptRoot 在脚本被直接粘进控制台执行时也是空的，Join-Path 同样不接受空 Path。
+if (-not $signin -or -not (Test-Path $signin)) {
+    if ($PSScriptRoot) { $signin = Join-Path $PSScriptRoot "signin.py" }
+}
+if (-not $signin -or -not (Test-Path $signin)) { $signin = Join-Path (Get-Location) "signin.py" }
+if (-not $signin -or -not (Test-Path $signin)) {
     Write-Host " 失败" -ForegroundColor Red
     Write-Host ""
     Write-Host "没找到 signin.py。请把本脚本和 signin.py 放在同一目录后重跑，" -ForegroundColor Yellow
