@@ -30,6 +30,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
@@ -45,13 +46,16 @@ CODE_BUDGET_OUT = -2   # 本次运行的时间预算已耗尽，主动放弃后�
 # 留 60s 给解释器启动和收尾）；若你把定时任务的时限调大，这两处要一起改。
 DEFAULT_BUDGET_SECONDS = 420.0
 MAX_BUDGET_SECONDS = 540.0
+# 成长中心轮询一天要跑好几次，单次预算相应收紧：它几乎没有必须完成的任务，
+# 与其让它占满 7 分钟，不如早失败、下次再试。
+POLL_BUDGET_SECONDS = 120.0
 REQUEST_TIMEOUT = 30
 _started_at = None
 _budget_seconds = DEFAULT_BUDGET_SECONDS
 _config_warning = None   # 配置非法时的告警，由 emit 统一带进输出
 
 
-def _parse_budget():
+def _parse_budget(default=DEFAULT_BUDGET_SECONDS):
     """解析预算环境变量。非法值/越界值一律夹到安全区间——绝不能在这里抛异常。
 
     这段逻辑曾写在模块顶层，WORKBUDDY_BUDGET_SECONDS=abc 会让进程在 main() 的
@@ -59,16 +63,16 @@ def _parse_budget():
     """
     raw = os.environ.get("WORKBUDDY_BUDGET_SECONDS")
     if not raw:
-        return DEFAULT_BUDGET_SECONDS, None
+        return default, None
     try:
         val = float(raw)
     except (TypeError, ValueError):
-        return DEFAULT_BUDGET_SECONDS, "WORKBUDDY_BUDGET_SECONDS=%r 不是数字，已回落 %s 秒" % (
-            raw, int(DEFAULT_BUDGET_SECONDS))
+        return default, "WORKBUDDY_BUDGET_SECONDS=%r 不是数字，已回落 %s 秒" % (
+            raw, int(default))
     if val <= 0:
         # "0" 是非空字符串，用 `or` 兜不住；且 0 会让每个请求都直接放弃，脚本永久失效
-        return DEFAULT_BUDGET_SECONDS, "WORKBUDDY_BUDGET_SECONDS=%s 必须为正数，已回落 %s 秒" % (
-            raw, int(DEFAULT_BUDGET_SECONDS))
+        return default, "WORKBUDDY_BUDGET_SECONDS=%s 必须为正数，已回落 %s 秒" % (
+            raw, int(default))
     if val > MAX_BUDGET_SECONDS:
         # 上限同样是硬要求：预算大于任务时限就等于没有预算，黑洞式超时会把进程跑到被强杀
         return MAX_BUDGET_SECONDS, ("WORKBUDDY_BUDGET_SECONDS=%s 超过上限，已夹到 %s 秒"
@@ -77,10 +81,14 @@ def _parse_budget():
     return val, None
 
 
-def _start_budget():
-    """启动预算时钟；配置非法时记下告警，由 emit 带进输出而不是静默回落。"""
+def _start_budget(action=None):
+    """启动预算时钟；配置非法时记下告警，由 emit 带进输出而不是静默回落。
+
+    轮询类命令（silent-growth）用更短的默认值，用户显式设置环境变量时仍以环境变量为准。
+    """
     global _started_at, _budget_seconds, _config_warning
-    _budget_seconds, _config_warning = _parse_budget()
+    default = POLL_BUDGET_SECONDS if action == "silent-growth" else DEFAULT_BUDGET_SECONDS
+    _budget_seconds, _config_warning = _parse_budget(default)
     _started_at = time.monotonic()
 
 
@@ -118,6 +126,24 @@ def find_auth_file():
 def load_session(auth_file):
     with open(auth_file, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_session_retry(auth_file, attempts=3, delay=2.0):
+    """带重试的凭据读取。
+
+    WorkBuddy 客户端刷新 token 时会短暂独占凭据文件，恰好在那一刻读取就是
+    PermissionError（实测：定时任务两次撞锁、整轮直接放弃）。锁是瞬时的，
+    等两秒再试即可；重试仍失败才真正报错。
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            return load_session(auth_file)
+        except PermissionError as e:
+            last = e
+            if i < attempts - 1:
+                time.sleep(delay)
+    raise last
 
 
 def build_headers(session):
@@ -247,6 +273,59 @@ def as_int(v, default=0):
         return default
 
 
+def _fmt_eta(arrive_at, server_now):
+    """把服务端返回的 Unix 时间戳换算成"还有多久回来"。
+
+    任一时间戳缺失/非法就返回空串——这是纯展示信息，绝不能因为它让整轮执行失败。
+    """
+    try:
+        left = float(arrive_at) - float(server_now)
+    except (TypeError, ValueError):
+        return ""
+    if left <= 0:
+        return "，已到达待领取"
+    if left < 3600:
+        return "，约 %d 分钟后回" % max(1, int(round(left / 60.0)))
+    return "，约 %.1f 小时后回" % (left / 3600.0)
+
+
+def _env_flag(name):
+    """开关型环境变量是否为真；空串与 0/false/no/off 一律视为关。"""
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _client_token(prefix="u"):
+    """活动接口（抽奖/连登兑换）要求的防重放 token。
+
+    官方前端用 `crypto.randomUUID()` 拼成 "u-<uuid>"，服务端只做幂等去重、
+    不校验格式；缺了它 /lottery/draw 直接 400（实测过）。
+    """
+    return "%s-%s" % (prefix, uuid.uuid4())
+
+
+# 连登兑换各档奖励的官方文案（2026-09 活动版本）。兑换成功的汇报优先用
+# 服务端返回的实际明细，挖不到字段时才回落到这里——活动改版时以响应为准。
+_REDEEM_REWARDS = {
+    "starter":   "+2 能量 +1 补登卡 +1 次抽奖",
+    "advanced":  "+50 积分 +3 能量 +1 补登卡 +1 次抽奖",
+    "legendary": "+150 积分 +5 能量 +1 补登卡 +1 次抽奖",
+}
+
+
+def _redeem_reward_desc(body, tier):
+    """兑换成功的奖励描述：能从响应里挖到积分/能量就拼实际值，否则用官方文案。"""
+    bits = []
+    credit = as_int(dig(body, "credit"), 0)
+    energy = as_int(dig(body, "energy"), 0)
+    if credit:
+        bits.append("+%s 积分" % fmt_credit(credit))
+    if energy:
+        bits.append("+%s 能量" % fmt_credit(energy))
+    if bits:
+        return "（%s）" % " ".join(bits)
+    return "（%s）" % _REDEEM_REWARDS.get(tier, "奖励已到账")
+
+
 def _dumps(out):
     """序列化汇报内容；default=str 兜住意外混入的非 JSON 类型，绝不让唯一的输出通道崩掉。"""
     try:
@@ -256,14 +335,21 @@ def _dumps(out):
 
 
 def emit(out, action):
-    """silent 模式写日志文件，其余模式打印到 stdout；本函数保证不抛异常。"""
+    """silent 模式写日志文件，其余模式打印到 stdout；本函数保证不抛异常。
+
+    ERROR 两条通道都走：计划任务里若把命令名写错（silent 拼成 slient 之类），
+    走 stdout 就等于扔进黑洞，无窗口运行下这次失败再没有任何痕迹——
+    正是本脚本想杜绝的"当天日志整条丢失"。
+    """
     if _config_warning and isinstance(out, dict):
         out = dict(out, config_warning=_config_warning)
     payload = _dumps(out)
+    is_error = isinstance(out, dict) and out.get("result") == "ERROR"
     if action != "silent":
         try:
             print(payload)
-            return
+            if not is_error:
+                return
         except Exception:
             pass  # stdout 不可用（编码/管道问题）时退到日志，至少不把结果丢掉
 
@@ -318,7 +404,7 @@ def _already_report(status, via=None):
 
 
 def run_growth(headers, endpoint):
-    """成长中心自动化：领旅行礼物→派 Buddy 出发→开盲盒→领任务奖→汇报。
+    """成长中心自动化：领旅行礼物→派 Buddy 出发→领任务奖→连登奖励兑换→开盲盒→能量开 Buddy→汇报。
 
     各子步骤单独 try，一段失败不影响其余领取；任一步遇 401/403 直接升级为 NO_SESSION。
     """
@@ -347,6 +433,15 @@ def run_growth(headers, endpoint):
             return 1, {"result": "NO_SESSION",
                        "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
         travel = dig(sbody, "state") if (200 <= scode < 300) else None
+        # 服务端明确给出"今日旅行名额已用完"。读它而不是等 depart 报错，
+        # 轮询场景下差别很大：后者会让每一轮都白撞一次墙。
+        daily_limit = bool(dig(sbody, "daily_limit_reached")) if (200 <= scode < 300) else False
+        if not (200 <= scode < 300):
+            # 5xx 之类绝不能当成"空跑"静默吞掉：轮询下空跑是不写日志的，
+            # 服务端故障就会彻底无声无息。-1/-2 已在上面提前返回。
+            parts.append("查旅行状态失败（HTTP %s）" % scode)
+            failures += 1
+            hard_failures += _is_hard_failure(scode)
         claimed_travel = False
         if travel == "arrived":
             record_id = dig(sbody, "record_id")
@@ -368,7 +463,10 @@ def run_growth(headers, endpoint):
                 hard_failures += _is_hard_failure(ccode)
             if claimed_travel:
                 travel = "idle"  # 只有领取成功后才视为 idle，允许派出发
-        if travel == "idle":
+        if travel == "idle" and daily_limit:
+            # 今日名额已用完：直接收手，不碰 config/depart，省掉两个请求和一条必然的失败
+            parts.append("今日旅行名额已用完")
+        elif travel == "idle":
             ccode, cbody = get(base + "/buddy/travel/config", headers)
             if _check_auth(ccode):
                 return 1, {"result": "NO_SESSION",
@@ -393,41 +491,15 @@ def run_growth(headers, endpoint):
                     hard_failures += _is_hard_failure(dcode)
         elif travel == "traveling":
             loc_name = (dig(sbody, "location") or {}).get("name", "?")
-            parts.append("Buddy 旅行中（%s）" % loc_name)
+            # arrive_at / server_now 是服务端时间戳，比本地时钟可靠
+            parts.append("Buddy 旅行中（%s%s）" % (
+                loc_name, _fmt_eta(dig(sbody, "arrive_at"), dig(sbody, "server_now"))))
     except Exception as e:
         parts.append("旅行模块异常（%s: %s）" % (type(e).__name__, e))
         failures += 1
         hard_failures += 1
 
-    # --- 2. 盲盒/抽奖 ---
-    if _budget_left() <= 0:
-        parts.append("时间预算耗尽，盲盒跳过")
-    else:
-        try:
-            lcode, lbody = get(base + "/lottery/chances", headers)
-            if _check_auth(lcode):
-                return 1, {"result": "NO_SESSION",
-                           "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
-            chances = as_int(dig(lbody, "balance")) if (200 <= lcode < 300) else 0
-            if chances > 0:
-                dcode, dbody = post(base + "/lottery/draw", headers, {})
-                if _check_auth(dcode):
-                    return 1, {"result": "NO_SESSION",
-                               "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
-                if 200 <= dcode < 300:
-                    prize = dig(dbody, "prize_name") or dig(dbody, "prize") or "未知"
-                    parts.append("开盲盒获得：%s" % prize)
-                    successes += 1
-                else:
-                    parts.append("开盲盒失败（HTTP %s）" % dcode)
-                    failures += 1
-                    hard_failures += _is_hard_failure(dcode)
-        except Exception as e:
-            parts.append("盲盒模块异常（%s: %s）" % (type(e).__name__, e))
-            failures += 1
-            hard_failures += 1
-
-    # --- 3. 任务领奖 ---
+    # --- 2. 任务领奖（放在抽奖前：任务送的抽奖机会/能量，后面马上能用上）---
     if _budget_left() <= 0:
         parts.append("时间预算耗尽，任务领奖跳过")
     else:
@@ -469,7 +541,110 @@ def run_growth(headers, endpoint):
             failures += 1
             hard_failures += 1
 
-    # --- 4. 能量 & 连签状态（纯展示值，预算不够就直接不取，不计失败）---
+    # --- 3. 连登奖励兑换（入门/进阶/巅峰三档，附积分/能量/补登卡/抽奖机会）---
+    # 入门 7 天、进阶 14 天、巅峰 28 天解锁。summary 只报 claimed/locked 两种
+    # 已见状态；"非 claimed 且非 locked"即视为可兑换去尝试，被服务端拒绝时按
+    # 普通业务失败处理（不算硬失败）。
+    if _budget_left() <= 0:
+        parts.append("时间预算耗尽，连登兑换跳过")
+    else:
+        try:
+            rcode, rbody = get(base + "/redeem/summary", headers)
+            if _check_auth(rcode):
+                return 1, {"result": "NO_SESSION",
+                           "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
+            if 200 <= rcode < 300:
+                for tier, label in (("starter", "入门"), ("advanced", "进阶"), ("legendary", "巅峰")):
+                    if _budget_left() <= 0:
+                        parts.append("时间预算耗尽，剩余连登兑换下次再领")
+                        break
+                    status = dig(rbody, tier + "_status")
+                    # 字段缺失（None）同样跳过：接口改版时不该让脚本对三档无脑 POST
+                    if not status or status in ("claimed", "locked"):
+                        continue
+                    c2code, c2body = post(base + "/redeem", headers,
+                                          {"tier": tier, "client_token": _client_token()})
+                    if _check_auth(c2code):
+                        return 1, {"result": "NO_SESSION",
+                                   "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
+                    if 200 <= c2code < 300:
+                        credits_gained += as_int(dig(c2body, "credit"))
+                        parts.append("连登兑换「%s」%s" % (label, _redeem_reward_desc(c2body, tier)))
+                        successes += 1
+                    else:
+                        msg = dig(c2body, "msg") or ""
+                        parts.append("连登兑换「%s」失败：%s" % (label, msg or "HTTP %s" % c2code))
+                        failures += 1
+                        hard_failures += _is_hard_failure(c2code)
+        except Exception as e:
+            parts.append("连登兑换模块异常（%s: %s）" % (type(e).__name__, e))
+            failures += 1
+            hard_failures += 1
+
+    # --- 4. 盲盒/抽奖（draw 必须带 client_token，缺了会 400）---
+    if _budget_left() <= 0:
+        parts.append("时间预算耗尽，盲盒跳过")
+    else:
+        try:
+            lcode, lbody = get(base + "/lottery/chances", headers)
+            if _check_auth(lcode):
+                return 1, {"result": "NO_SESSION",
+                           "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
+            chances = as_int(dig(lbody, "balance")) if (200 <= lcode < 300) else 0
+            if chances > 0:
+                dcode, dbody = post(base + "/lottery/draw", headers,
+                                    {"client_token": _client_token()})
+                if _check_auth(dcode):
+                    return 1, {"result": "NO_SESSION",
+                               "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
+                if 200 <= dcode < 300:
+                    prize = dig(dbody, "prize_name") or dig(dbody, "prize") or "未知"
+                    parts.append("开盲盒获得：%s" % prize)
+                    successes += 1
+                else:
+                    parts.append("开盲盒失败（HTTP %s）" % dcode)
+                    failures += 1
+                    hard_failures += _is_hard_failure(dcode)
+        except Exception as e:
+            parts.append("盲盒模块异常（%s: %s）" % (type(e).__name__, e))
+            failures += 1
+            hard_failures += 1
+
+    # --- 5. Buddy 盲盒（能量攒够 cost_per_open 就开；能量没有其它消耗出口）---
+    if _budget_left() <= 0:
+        parts.append("时间预算耗尽，Buddy 盲盒跳过")
+    else:
+        try:
+            qcode, qbody = get(base + "/buddy/quota", headers)
+            if _check_auth(qcode):
+                return 1, {"result": "NO_SESSION",
+                           "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
+            if 200 <= qcode < 300:
+                affordable = as_int(dig(qbody, "affordable"))
+                max_open = as_int(dig(qbody, "max_open_count"), 1) or 1
+                if affordable > 0:
+                    count = min(affordable, max_open)
+                    ocode, obody = post(base + "/buddy/open", headers, {"count": count})
+                    if _check_auth(ocode):
+                        return 1, {"result": "NO_SESSION",
+                                   "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
+                    if 200 <= ocode < 300:
+                        name = dig(obody, "buddy") or dig(obody, "name") or dig(obody, "buddies")
+                        if not isinstance(name, str):
+                            name = "新 Buddy"
+                        parts.append("开 Buddy 盲盒 ×%s（%s）" % (count, name))
+                        successes += 1
+                    else:
+                        msg = dig(obody, "msg") or ""
+                        parts.append("开 Buddy 盲盒失败：%s" % (msg or "HTTP %s" % ocode))
+                        failures += 1
+                        hard_failures += _is_hard_failure(ocode)
+        except Exception as e:
+            parts.append("Buddy 盲盒模块异常（%s: %s）" % (type(e).__name__, e))
+            failures += 1
+            hard_failures += 1
+
+    # --- 6. 能量 & 连签状态（纯展示值，预算不够就直接不取，不计失败）---
     energy = None
     streak_days = None
     if _budget_left() > 0:
@@ -509,8 +684,11 @@ def run_growth(headers, endpoint):
     # 只有"确有需要关注的失败且一件都没成"才算整体失败。
     # 派 Buddy 已达每日上限这类 4xx 是每天的常态，不能让计划任务天天报红。
     result_code = 1 if (hard_failures and not successes) else 0
+    # idle = 这一轮既没领到东西也没出错，纯空跑（Buddy 还在路上 / 今日名额已用完 /
+    # 确实没有可领项）。轮询任务靠它决定要不要写日志。
+    idle = (successes == 0 and failures == 0)
     return result_code, {"result": "GROWTH", "report": report, "credits_gained": credits_gained,
-                         "energy": energy, "streak_days": streak_days,
+                         "energy": energy, "streak_days": streak_days, "idle": idle,
                          **({"failures": failures} if failures else {})}
 
 
@@ -629,8 +807,8 @@ def main():
 
 
 def _run(action):
-    _start_budget()
-    known = ("auto", "silent", "growth", "status", "claim", "all")
+    _start_budget(action)
+    known = ("auto", "silent", "growth", "silent-growth", "status", "claim", "all")
     if action not in known:
         emit({"result": "ERROR",
               "report": "未知命令：%s（可用：%s）" % (action, " / ".join(known))},
@@ -649,7 +827,7 @@ def _run(action):
         return 2
 
     try:
-        session = load_session(auth_file)
+        session = load_session_retry(auth_file)
     except json.JSONDecodeError as e:
         # JSONDecodeError 是 ValueError 的子类，必须先于下面的分支捕获，否则会被误归类
         emit({"result": "ERROR",
@@ -706,6 +884,16 @@ def _run(action):
     if action == "growth":
         code, out = run_growth(headers, endpoint)
         emit(out, action)
+        return code
+
+    if action == "silent-growth":
+        # 只跑成长中心，结果写日志文件（emit 的第二个参数必须是 silent 才落盘）。
+        # 不碰签到接口：签到一天一次就够，轮询没必要反复打它。
+        # 空跑默认不落盘——一天要跑好几轮，全写进去只会把真正有价值的记录
+        # 淹没在一串"Buddy 旅行中"里。要看完整过程就设 WORKBUDDY_GROWTH_LOG_EMPTY=1。
+        code, out = run_growth(headers, endpoint)
+        if (not out.get("idle")) or _env_flag("WORKBUDDY_GROWTH_LOG_EMPTY"):
+            emit(out, "silent")
         return code
 
     # 以下为交互式调试命令，输出原始返回。走 emit 而非 print，这样非法配置的
