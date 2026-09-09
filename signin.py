@@ -249,6 +249,30 @@ def _is_hard_failure(code):
     return code >= 500 or code in (CODE_NO_NETWORK, CODE_BUDGET_OUT)
 
 
+def _http_label(code):
+    """把伪 HTTP 码翻译成人话；-1/-2 是脚本自定义的"没拿到响应"标记。"""
+    if code == CODE_NO_NETWORK:
+        return "网络不可达"
+    if code == CODE_BUDGET_OUT:
+        return "时间预算耗尽"
+    return "HTTP %s" % code
+
+
+def _is_no_chance(msg):
+    """抽奖失败是否只是"没有次数"——这是常态，不是故障。
+
+    服务端对"次数为 0"返回 400 + `insufficient lottery chance balance`，和真正的
+    参数错误（`invalid request`）同为 400，只看状态码会把两者混为一谈：把常态记成
+    失败，轮询就会每轮强制落盘、还会把失败数算进汇报。
+    """
+    m = str(msg or "").lower()
+    if not m:
+        return False
+    if "insufficient" in m or "not enough" in m:
+        return "chance" in m or "balance" in m
+    return "no chance" in m
+
+
 def dig(obj, key):
     """在可能被 data/result 包裹的响应里找字段，兼容信封结构。"""
     if isinstance(obj, dict):
@@ -284,6 +308,19 @@ def as_int(v, default=0):
         return int(float(v))  # 兼容 "1.5"/"1e3" 这类数字串，宁可截断也不把真实数值丢成 0
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _first_int(body, key, fallback=0):
+    """优先取响应里的实际数值，挖不到才用回落值。
+
+    任务列表里的 reward_credit 只是活动配置，与服务端这次实际发放的可能不同；
+    上报按响应值才不会虚报，响应里没有时才退回配置值。
+    """
+    if isinstance(body, dict):
+        v = dig(body, key)
+        if v is not None:
+            return as_int(v)
+    return as_int(fallback)
 
 
 def _fmt_eta(arrive_at, server_now):
@@ -442,6 +479,32 @@ def run_growth(headers, endpoint):
         """返回 True 表示需要立即退出（登录态失效）。"""
         return code in (401, 403)
 
+    def _note_http(code, body, label):
+        """前置查询接口非 2xx 时的统一记录；返回 True 表示调用方应跳过后续处理。
+
+        硬失败（5xx / 网络不可达 / 预算耗尽）必须计入 failures：否则整轮
+        successes=0 且 failures=0 会被判成 idle，轮询既不写日志又返回 0，
+        服务端故障彻底无声无息。旅行模块早就这么做了，其余各段没跟上。
+
+        4xx 只进报告、不计失败：绝大多数是业务规则（活动未开始、接口下线），
+        计入会让轮询天天强制落盘。手动跑 `growth` 仍能在报告里看到它。
+        """
+        nonlocal failures, hard_failures
+        if 200 <= code < 300:
+            return False
+        reason = _http_label(code)
+        detail = ""
+        if isinstance(body, dict):
+            detail = str(body.get("error") or body.get("msg") or "")
+        # 状态码与服务端给的详情都保留：只知道 500 无法判断影响，只知道 "timed out"
+        # 又看不出是网络还是服务端，轮询日志里这两者都想要
+        parts.append("%s失败：%s" % (label, "%s（%s）" % (reason, detail)
+                                     if detail and detail != reason else (detail or reason)))
+        if _is_hard_failure(code):
+            failures += 1
+            hard_failures += 1
+        return True
+
     # --- 1. Buddy 旅行：领礼物 + 派出发 ---
     try:
         scode, sbody = get(base + "/buddy/travel/status", headers)
@@ -459,12 +522,7 @@ def run_growth(headers, endpoint):
         # 服务端明确给出"今日旅行名额已用完"。读它而不是等 depart 报错，
         # 轮询场景下差别很大：后者会让每一轮都白撞一次墙。
         daily_limit = bool(dig(sbody, "daily_limit_reached")) if (200 <= scode < 300) else False
-        if not (200 <= scode < 300):
-            # 5xx 之类绝不能当成"空跑"静默吞掉：轮询下空跑是不写日志的，
-            # 服务端故障就会彻底无声无息。-1/-2 已在上面提前返回。
-            parts.append("查旅行状态失败（HTTP %s）" % scode)
-            failures += 1
-            hard_failures += _is_hard_failure(scode)
+        _note_http(scode, sbody, "查旅行状态")
         claimed_travel = False
         if travel == "arrived":
             record_id = dig(sbody, "record_id")
@@ -531,7 +589,7 @@ def run_growth(headers, endpoint):
             if _check_auth(tcode):
                 return 1, {"result": "NO_SESSION",
                            "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
-            if 200 <= tcode < 300:
+            if not _note_http(tcode, tbody, "查任务列表"):
                 tasks = dig(tbody, "tasks") or []
                 for t in tasks:
                     if _budget_left() <= 0:
@@ -553,10 +611,9 @@ def run_growth(headers, endpoint):
                         # 进度显示已达标也只当"领取"，因为这一 POST 大概率只是接单而非发奖，
                         # 按领奖上报会把没到账的积分算进 credits_gained；下一轮再正常领奖。
                         claiming = bool(done and status)
-                        # has_reward 只在领奖时作为前置条件。它若表示"有待领取的奖励"，
-                        # 新任务上必然为假，用它拦截接单会让"自动领取新任务"永不触发。
-                        if claiming and not t.get("has_reward"):
-                            continue
+                        # 不再拿 has_reward 做前置条件：实测 16 个任务全部为 true，连 14 个
+                        # 已 claimed 的也是——它是"该任务设有奖励"的静态属性，不是"有待领取的
+                        # 奖励"。用它拦截只会把 has_reward=false 却真有奖励的任务永久漏掉。
                         acode, abody = post(base + "/tasks/accept", headers,
                                             {"task_code": t.get("task_code")})
                         if _check_auth(acode):
@@ -565,8 +622,11 @@ def run_growth(headers, endpoint):
                         title = t.get("title", t.get("task_code"))
                         if 200 <= acode < 300:
                             if claiming:
-                                rc = as_int(t.get("reward_credit"))
-                                re_ = as_int(t.get("reward_energy"))
+                                # 优先用服务端实际发放的数值；列表里的 reward_credit
+                                # 只是活动配置，改版时会和实发对不上（旅行礼物、连登兑换
+                                # 都已按响应值上报，这里保持一致）。挖不到才回落到列表值。
+                                rc = _first_int(abody, "credit", t.get("reward_credit"))
+                                re_ = _first_int(abody, "energy", t.get("reward_energy"))
                                 credits_gained += rc
                                 parts.append("领任务奖「%s」+credit%s+energy%s" % (title, rc, re_))
                             else:
@@ -607,7 +667,7 @@ def run_growth(headers, endpoint):
             if _check_auth(mcode):
                 return 1, {"result": "NO_SESSION",
                            "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
-            if 200 <= mcode < 300:
+            if not _note_http(mcode, mbody, "查连登状态"):
                 streak_body = mbody
                 # 余额兼容两种形状：{"makeup_cards":{"balance":2}} 与 {"makeup_cards":2}。
                 # 只认前者的话，接口是后者时整个补登会一声不响地永不执行。
@@ -663,7 +723,7 @@ def run_growth(headers, endpoint):
             if _check_auth(rcode):
                 return 1, {"result": "NO_SESSION",
                            "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
-            if 200 <= rcode < 300:
+            if not _note_http(rcode, rbody, "查连登兑换"):
                 for tier, label in (("starter", "入门"), ("advanced", "进阶"), ("legendary", "巅峰")):
                     if _budget_left() <= 0:
                         parts.append("时间预算耗尽，剩余连登兑换下次再领")
@@ -700,7 +760,7 @@ def run_growth(headers, endpoint):
             if _check_auth(lcode):
                 return 1, {"result": "NO_SESSION",
                            "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
-            chances = as_int(dig(lbody, "balance")) if (200 <= lcode < 300) else 0
+            chances = 0 if _note_http(lcode, lbody, "查抽奖机会") else as_int(dig(lbody, "balance"))
             if chances > 0:
                 dcode, dbody = post(base + "/lottery/draw", headers,
                                     {"client_token": _client_token()})
@@ -719,10 +779,19 @@ def run_growth(headers, endpoint):
                         prize += "（实物奖，需到成长中心填写收件信息）"
                     parts.append("开盲盒获得：%s" % prize)
                     successes += 1
+                    # 一轮只开一次：这条写路径不可逆，剩下的机会留给下一轮更稳妥
+                    if chances > 1:
+                        parts.append("还剩 %s 次抽奖机会，下轮继续" % (chances - 1))
                 else:
-                    parts.append("开盲盒失败（HTTP %s）" % dcode)
-                    failures += 1
-                    hard_failures += _is_hard_failure(dcode)
+                    msg = dig(dbody, "msg") or ""
+                    if _is_no_chance(msg):
+                        # 次数为 0 是常态（次数来自连登兑换），不是故障：计入失败会让
+                        # 轮询每轮强制落盘，还会把常态算进失败统计
+                        parts.append("开盲盒：%s" % (msg or "无抽奖机会"))
+                    else:
+                        parts.append("开盲盒失败：%s" % (msg or "HTTP %s" % dcode))
+                        failures += 1
+                        hard_failures += _is_hard_failure(dcode)
         except Exception as e:
             parts.append("盲盒模块异常（%s: %s）" % (type(e).__name__, e))
             failures += 1
@@ -737,7 +806,7 @@ def run_growth(headers, endpoint):
             if _check_auth(qcode):
                 return 1, {"result": "NO_SESSION",
                            "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
-            if 200 <= qcode < 300:
+            if not _note_http(qcode, qbody, "查 Buddy 能量"):
                 affordable = as_int(dig(qbody, "affordable"))
                 max_open = as_int(dig(qbody, "max_open_count"), 1) or 1
                 if affordable > 0:
