@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  WorkBuddy 自动签到 · launchd 配置模板（macOS）
+  ===============================================================
+  仓库：https://github.com/88lin/workbuddy-auto-signin （作者 88lin · MIT）
+  签到接口系逆向所得，服务端改一版就可能失效——修复都会推到上面这个仓库。
+  顺手点个 ⭐ Star，等哪天连签莫名其妙断了，你能一秒把它找回来。
+
+  用法：
+    1. 确认 Python 3 的真实路径（第 3 步要用）：
+         which python3
+    2. 复制到 LaunchAgents 目录（该目录首次使用时可能不存在，先建）：
+         mkdir -p ~/Library/LaunchAgents
+         cp workbuddy-auto-signin.plist.example ~/Library/LaunchAgents/workbuddy-auto-signin.plist
+    3. 编辑该文件，把下面 ProgramArguments / WorkingDirectory 里的
+       /PATH/TO/workbuddy-auto-signin 改成你的真实脚本目录绝对路径；
+       若第 1 步输出的不是 /usr/bin/python3，把 ProgramArguments 第一项也换掉。
+    4. 加载（重复加载不会报错）：
+         launchctl bootout gui/$(id -u)/workbuddy-auto-signin 2>/dev/null
+         launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/workbuddy-auto-signin.plist
+    5. 卸载：
+         launchctl bootout gui/$(id -u)/workbuddy-auto-signin
+
+  ⚠️ 别照抄 /usr/bin/python3！
+     没装 Xcode Command Line Tools 时它只是个占位壳子：命令行里跑会弹安装框，
+     launchd 里跑则是直接失败，错误只进 .err 文件，很难联想到这一层。
+     Homebrew 装的 Python 一般在 /opt/homebrew/bin/python3（Intel 机为
+     /usr/local/bin/python3）——一律以 which python3 的实际输出为准。
+
+  ⚠️ 脚本不要放在 ~/Documents、~/Desktop、~/Downloads 下！
+     macOS 的隐私保护（TCC）会拦截后台进程读取这些目录，报
+     "Operation not permitted"，表现为任务静默失败。
+     推荐放在 ~/Library/Application Support/ 或用户主目录下的普通文件夹。
+
+  行为说明：
+    - StartCalendarInterval：每天 00:05 触发（与 Windows 版一致；
+      想换时间就改下面的 Hour / Minute）。
+    - StartInterval：每 4 小时再跑一次。跑的同样是完整的 auto，所以它既是
+      成长中心轮询——领回 Buddy 旅行礼物、补上当天错过的派出——也顺带兜住
+      "00:05 没开机"的情况：只要当天开过机，4 小时内就会补上签到。
+      脚本幂等，重复触发不会重复领取（已签会直接返回 ALREADY）。
+    - RunAtLoad：登录时立即跑一次，补上关机/睡眠期间错过的签到。
+    - EnvironmentVariables：launchd 给的环境很干净，通常连 LANG 都没有，
+      Python 的 stdout 编码就可能不是 UTF-8——而汇报全是中文，写下去会抛
+      UnicodeEncodeError。脚本兜得住（会改写 signin.log），但那样 .out 就是空的、
+      人会一头雾水。显式钉死 UTF-8，从根上避免这一类。
+    - 日志：stdout/stderr 由 launchd 重定向到下面两个文件。
+      查看：tail -20 /tmp/workbuddy-auto-signin.out
+      排错看 .err（Python 报错、权限拒绝都在那儿）。
+      注意 auto 模式每轮都会追加一行（不像 Windows 的 silent-growth 会跳过
+      空跑），launchd 也不做轮转；介意体积就定期清空，或把下面的路径改成你
+      自己管理的绝对路径（plist 不支持 ~ 简写）。
+    - 凭据失效时脚本会返回 NO_SESSION，日志里能直接看到，重新登录桌面端即自动恢复。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>workbuddy-auto-signin</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/PATH/TO/workbuddy-auto-signin/signin.py</string>
+        <string>auto</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/PATH/TO/workbuddy-auto-signin</string>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>0</integer>
+            <key>Minute</key>
+            <integer>5</integer>
+        </dict>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>14400</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONIOENCODING</key>
+        <string>utf-8</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/workbuddy-auto-signin.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/workbuddy-auto-signin.err</string>
+</dict>
+</plist>

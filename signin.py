@@ -1,5 +1,12 @@
 """WorkBuddy 每日签到自动领取脚本。
 
+作者：88lin
+仓库：https://github.com/88lin/workbuddy-auto-signin
+协议：MIT
+
+签到接口系从桌面端逆向所得，服务端改一版就可能失效——修复都会推到上面这个仓库。
+顺手点个 ⭐ Star，等哪天连签莫名其妙断了，你能一秒把它找回来。
+
 读取本机 WorkBuddy 桌面端的登录会话，调用其签到接口自动领取每日积分：
   POST {endpoint}/v2/billing/meter/checkin-activity-status  查询签到状态
   POST {endpoint}/v2/billing/meter/daily-checkin            领取今日积分
@@ -271,6 +278,20 @@ def _is_no_chance(msg):
     if "insufficient" in m or "not enough" in m:
         return "chance" in m or "balance" in m
     return "no chance" in m
+
+
+def _is_unknown_tier(code, body):
+    """连登兑换是否因为"tier 这个值本身不认识"被拒——用于判断要不要换一种写法重试。
+
+    /redeem 实测收的是天数（7/14/28），档位名会得到 400 + `unknown tier`。但这一点
+    只在一台机器上验过，接口哪天要是改成只认档位名，脚本就会三档全废且看不出原因。
+    这类 400 是参数校验阶段的拒绝，服务端没兑换任何东西，换个写法重试是安全的；
+    `invalid request`（未解锁）这种业务拒绝不在此列，不能重试。
+    """
+    if code != 400:
+        return False
+    m = str(dig(body, "msg") or "").lower()
+    return "tier" in m and ("unknown" in m or "invalid" in m or "unsupported" in m)
 
 
 def dig(obj, key):
@@ -724,16 +745,30 @@ def run_growth(headers, endpoint):
                 return 1, {"result": "NO_SESSION",
                            "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
             if not _note_http(rcode, rbody, "查连登兑换"):
-                for tier, label in (("starter", "入门"), ("advanced", "进阶"), ("legendary", "巅峰")):
+                # tier 传「天数」：实测传 "starter" 这类档位名直接 400 unknown tier，
+                # 传 7/14/28 才被识别（未解锁时回 invalid request，那才是业务拒绝）。
+                # 档位名只用于读 *_status 字段和展示文案。
+                # 这一点只在一台机器上验过，接口若改成只认档位名，下面有兜底重试。
+                for tier, label, days in (("starter", "入门", 7),
+                                          ("advanced", "进阶", 14),
+                                          ("legendary", "巅峰", 28)):
                     if _budget_left() <= 0:
                         parts.append("时间预算耗尽，剩余连登兑换下次再领")
                         break
                     status = dig(rbody, tier + "_status")
-                    # 字段缺失（None）同样跳过：接口改版时不该让脚本对三档无脑 POST
+                    # 字段缺失（None）同样跳过：接口改版时不该让脚本对三档无脑 POST。
+                    # 注意别在这里再加 *_count 之类的"双保险"：实测响应里
+                    # starter_count=1 与 total_consumed=0 并存，count 到底是
+                    # "已兑换次数"还是"可兑换次数"并不确定，猜错就会把整段静默关掉。
                     if not status or status in ("claimed", "locked"):
                         continue
                     c2code, c2body = post(base + "/redeem", headers,
-                                          {"tier": tier, "client_token": _client_token()})
+                                          {"tier": days, "client_token": _client_token()})
+                    # 天数被判为未知档位时退回档位名再试一次：这类 400 是参数校验阶段
+                    # 的拒绝，服务端没兑换任何东西，重试不会重复领取
+                    if _is_unknown_tier(c2code, c2body):
+                        c2code, c2body = post(base + "/redeem", headers,
+                                              {"tier": tier, "client_token": _client_token()})
                     if _check_auth(c2code):
                         return 1, {"result": "NO_SESSION",
                                    "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
