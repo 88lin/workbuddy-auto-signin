@@ -25,7 +25,8 @@ WORKBUDDY_AUTH_FILE 指定。任何模式下都不会打印令牌，可安全分
   python signin.py auto           # 每日自动化：签到 + 成长中心（礼物/任务/补登/兑换/抽奖/Buddy）
   python signin.py silent         # 同 auto，但结果写日志文件而非 stdout（配合 pythonw.exe 静默运行）
   python signin.py growth         # 仅成长中心（不签到）
-  python signin.py silent-growth  # 仅成长中心 + 写日志文件（配合成长中心轮询任务）
+  python signin.py silent-poll    # 轮询：补签（未签才签）+ 成长中心，空跑不写日志
+  python signin.py silent-growth  # silent-poll 的旧名，行为完全相同（老计划任务仍可用）
   python signin.py status         # 仅查签到状态（调试）
   python signin.py claim          # 仅领取签到（调试，幂等）
   python signin.py all            # 查签到状态 + 领取（调试）
@@ -55,17 +56,30 @@ CODE_BUDGET_OUT = -2   # 本次运行的时间预算已耗尽，主动放弃后�
 # 这四个常量与 install-windows.ps1 里的 ExecutionTimeLimit 一一对应，改一处就要改另一处。
 DEFAULT_BUDGET_SECONDS = 420.0
 MAX_BUDGET_SECONDS = 540.0          # 签到任务 PT10M = 600s - 60s
-# 成长中心轮询一天要跑好几次，单次预算相应收紧：它几乎没有必须完成的任务，
-# 与其让它占满 7 分钟，不如早失败、下次再试。
-POLL_BUDGET_SECONDS = 120.0
+# 轮询任务如今也负责补签（见 run_daily），预算比"只跑成长中心"时期宽一些，好让
+# 冷启动重试跑得完；但仍远小于 PT5M，跑不完就早收尾、四小时后再来。
+POLL_BUDGET_SECONDS = 180.0
 POLL_MAX_BUDGET_SECONDS = 240.0     # 轮询任务 PT5M = 300s - 60s
 # 每轮最多用掉几张补登卡。卡是稀缺资源（上限 4 张），而这条写路径还没被真实响应
 # 验证过，一轮只花一张：猜错形状也只错一次，一天 6 轮照样能把断登补完。
 MAKEUP_MAX_PER_RUN = 1
 REQUEST_TIMEOUT = 30
+# 网络类失败的退避节奏（秒）。定时任务最容易撞上的就是"刚开机/刚唤醒"：WiFi 重连、
+# DHCP 续租、VPN 拨通往往要几十秒，而原来的策略是"5 秒后再试一次"——两次都撞在同
+# 一堵墙上，420 秒预算只花掉 5 秒就判了当天死刑。退避到分钟级才真正跨得过这个窗口：
+# 最多 6 次尝试摊开约 3.5 分钟，仍在签到任务的预算内。实际跑几轮由剩余预算决定
+# （见 _request_with_retry 的守卫），轮询任务预算短，会自动少跑几轮。
+NETWORK_RETRY_DELAYS = (5, 15, 30, 60, 90)
+# 5xx 是服务端抖动，不是本机网络没就绪，短促重试即可——干等几分钟既救不了它，
+# 还会把预算耗光，让后面的成长中心一个都跑不成。
+SERVER_RETRY_DELAYS = (3, 10)
 _started_at = None
 _budget_seconds = DEFAULT_BUDGET_SECONDS
 _config_warning = None   # 配置非法时的告警，由 emit 统一带进输出
+
+# 轮询类命令：预算更短，且空跑不落盘。silent-growth 是 silent-poll 的旧名，
+# 已安装的计划任务还在用它，必须继续认。
+POLL_ACTIONS = ("silent-poll", "silent-growth")
 
 
 def _parse_budget(default=DEFAULT_BUDGET_SECONDS, maximum=MAX_BUDGET_SECONDS):
@@ -100,11 +114,11 @@ def _parse_budget(default=DEFAULT_BUDGET_SECONDS, maximum=MAX_BUDGET_SECONDS):
 def _start_budget(action=None):
     """启动预算时钟；配置非法时记下告警，由 emit 带进输出而不是静默回落。
 
-    轮询类命令（silent-growth）用更短的默认值和更低的上限，用户显式设置环境变量时
-    仍以环境变量为准，但同样夹在该命令自己的上限内。
+    轮询类命令（silent-poll / silent-growth）用更短的默认值和更低的上限，用户显式设置
+    环境变量时仍以环境变量为准，但同样夹在该命令自己的上限内。
     """
     global _started_at, _budget_seconds, _config_warning
-    if action == "silent-growth":
+    if action in POLL_ACTIONS:
         default, maximum = POLL_BUDGET_SECONDS, POLL_MAX_BUDGET_SECONDS
     else:
         default, maximum = DEFAULT_BUDGET_SECONDS, MAX_BUDGET_SECONDS
@@ -215,36 +229,66 @@ def _request(url, headers, method="GET", payload=None, timeout=REQUEST_TIMEOUT):
 
 def post(url, headers, payload=None, retry=False):
     """POST 默认不重试：抽奖/领奖等写操作若在服务端处理完成后才超时，重试会重复提交。"""
-    return _request_with_retry(url, headers, method="POST", payload=payload,
-                               retries=1 if retry else 0)
+    return _request_with_retry(url, headers, method="POST", payload=payload, retry=retry)
 
 
 def get(url, headers):
-    return _request_with_retry(url, headers, method="GET", retries=1)
+    return _request_with_retry(url, headers, method="GET", retry=True)
 
 
-def _request_with_retry(url, headers, method="GET", payload=None, retries=1, delay=5):
-    """带时间预算的请求：超时上限随剩余预算收缩，预算不足则直接放弃而不是硬等。
+def _retry_delays(code):
+    """该失败码对应的退避节奏；空元组表示"重试也没用"，立刻如实返回。
+
+    只有这两类值得再试：本机网络没就绪（-1）、服务端抖动（5xx）。
+    4xx 是业务规则或参数问题，重试一百次也是同一个答案；CODE_BUDGET_OUT 更是
+    连请求都没发出去，再试只会离被强杀更近一步。
+    """
+    if code == CODE_NO_NETWORK:
+        return NETWORK_RETRY_DELAYS
+    if code >= 500:
+        return SERVER_RETRY_DELAYS
+    return ()
+
+
+def _request_with_retry(url, headers, method="GET", payload=None, retry=True):
+    """带时间预算的请求：失败按退避节奏重试，超时上限随剩余预算收缩，预算不足则直接放弃。
 
     返回 CODE_BUDGET_OUT 表示"没发出去，因为再发就要超出任务时限了"——调用方据此提前
     收尾，保证 emit 一定能执行到。
+
+    退避节奏见 NETWORK_RETRY_DELAYS：早期版本固定"重试 1 次、隔 5 秒"，对定时任务
+    最常见的失败场景（刚开机/唤醒，网络还要几十秒才就绪）几乎是无效重试。
     """
-    left = _budget_left()
-    if left <= 1:
+    if _budget_left() <= 1:
         return CODE_BUDGET_OUT, {"error": "已达本次运行时间预算，跳过剩余请求"}
 
     code, body = _request(url, headers, method=method, payload=payload,
-                          timeout=max(1, min(REQUEST_TIMEOUT, left)))
-    for _ in range(retries):
-        if code != CODE_NO_NETWORK:
-            break
-        # 重试要占掉 delay + 一整个超时，预算不够就别开始
+                          timeout=max(1, min(REQUEST_TIMEOUT, _budget_left())))
+    if not retry:
+        return code, body
+
+    # 退避进度按"失败类型"各记一份，而不是一个全局计数。
+    # 失败类型会在重试途中变化：典型的是冷启动——前几次网络不可达（网卡刚连上），
+    # 之后转成 500（代理还没就绪）。全局计数会让这种 5xx 撞上已经用光的计数、
+    # 一次都重试不到（网络类已推进到 2，而 5xx 的节奏只有 2 项）。按节奏分桶后，
+    # 每类各自从头走自己的退避表。总尝试次数仍有界：至多 len(两类节奏之和)+1 次。
+    attempts = {}
+    while True:
+        delays = _retry_delays(code)
+        if not delays:
+            return code, body
+        used = attempts.get(delays, 0)
+        if used >= len(delays):
+            return code, body
+        delay = delays[used]
+        attempts[delays] = used + 1
+        # 一轮重试最坏要占掉 delay + 一整个超时，预算不够就别开始：宁可现在如实返回
+        # 失败，也不能跑穿任务时限被系统强杀——那样连日志都写不出来，当天记录整条丢失。
         if _budget_left() <= delay + REQUEST_TIMEOUT:
-            break
+            return code, body
         time.sleep(delay)
         code, body = _request(url, headers, method=method, payload=payload,
                               timeout=max(1, min(REQUEST_TIMEOUT, _budget_left())))
-    return code, body
 
 
 def _is_hard_failure(code):
@@ -414,9 +458,9 @@ def _dumps(out):
 def emit(out, action):
     """silent 类模式写日志文件，其余模式打印到 stdout；本函数保证不抛异常。
 
-    判定用前缀而不是等号：silent-growth 同样是无窗口跑的，pythonw 下 sys.stdout 是
-    None，print 会静默成功（不抛异常），于是"打到 stdout"等于扔进黑洞——NO_AUTH、
-    NO_SESSION 这类最需要人处理的结果会一条不剩地消失。
+    判定用前缀而不是等号：silent-poll / silent-growth 同样是无窗口跑的，pythonw 下
+    sys.stdout 是 None，print 会静默成功（不抛异常），于是"打到 stdout"等于扔进黑洞——
+    NO_AUTH、NO_SESSION 这类最需要人处理的结果会一条不剩地消失。
 
     ERROR 两条通道都走：计划任务里若把命令名写错（silent 拼成 slient 之类），
     action 不带 silent 前缀，走 stdout 就等于扔进黑洞，无窗口运行下这次失败再没有
@@ -942,6 +986,14 @@ def run_auto(headers, endpoint):
             "http": scode,
         }
     if not (200 <= scode < 300):
+        # 401/403 归到 NO_SESSION：客户端没开或登录过期时，签到接口就是这么回的，
+        # 把它当成笼统的 HTTP 异常会让人对着 "HTTP 401" 去猜是接口挂了还是登录过期。
+        if scode in (401, 403):
+            return 1, {
+                "result": "NO_SESSION",
+                "report": "登录态已失效（HTTP %s），请重新登录 WorkBuddy 桌面端" % scode,
+                "http": scode,
+            }
         return 1, {
             "result": "ERROR",
             "report": "签到接口返回异常（HTTP %s），请重新登录客户端或稍后重试" % scode,
@@ -1023,6 +1075,47 @@ def run_auto(headers, endpoint):
     }
 
 
+def run_daily(headers, endpoint):
+    """一轮完整的日常：查状态→未签才领→再跑成长中心。返回 (退出码, 输出, 是否空跑)。
+
+    这是 auto / silent / silent-poll 三条路径的共用实现。轮询之所以要跑它而不是
+    "只跑成长中心"，是因为签到原本一天只有 00:05 这一次机会：那一次撞上关机、
+    睡眠、或刚开机网络还没就绪，当天就再无补救，连签直接断。让每一次轮询都带上
+    签到，等于一天七次机会，且不会重复领取——接口幂等，已签会直接返回 ALREADY。
+
+    第三个返回值是给轮询用的静默判据：这一轮没有任何值得一提的事（已签 + 成长
+    中心无可领取项）。定时任务不关心它，照写日志；轮询靠它决定要不要落盘。
+    """
+    code, out = run_auto(headers, endpoint)
+    # 网络本就不可达时不必再跑成长中心的一串请求（每个都要重试+等待），也免得
+    # 汇报出"无可领取项"这种假的安心话
+    if out.get("result") in ("NETWORK", "TIMEOUT"):
+        out["growth"] = "网络不可达或时间预算耗尽，成长中心跳过"
+        out["growth_result"] = out["result"]
+        return code, out, False
+    # 登录态已失效时同理：后面每个请求都只会再返回一次 401，白跑且刷屏
+    if out.get("result") == "NO_SESSION":
+        out["growth"] = "登录态已失效，成长中心跳过"
+        out["growth_result"] = out["result"]
+        return code, out, False
+    # 签到后顺带跑成长中心；它出任何问题都不能吞掉签到已成功的事实
+    try:
+        gcode, gout = run_growth(headers, endpoint)
+    except Exception as e:
+        gcode, gout = 1, {"result": "ERROR",
+                          "report": "成长中心异常（%s: %s）" % (type(e).__name__, e)}
+    out["growth"] = gout.get("report")
+    out["growth_result"] = gout.get("result")
+    if gout.get("credits_gained"):
+        out["report"] += "；" + gout["report"]
+    # run_growth 只在"确有硬失败且一件都没成"时返回非 0（无可领取项、4xx 业务规则
+    # 均返回 0），直接透传即可——之前按 result 枚举漏了 result=GROWTH 的整体失败
+    if gcode != 0 and code == 0:
+        code = gcode
+    quiet = out.get("result") in ("ALREADY", "INACTIVE") and bool(gout.get("idle"))
+    return code, out, quiet
+
+
 def main():
     """薄壳：只负责取命令 + 兜住一切异常，保证 silent 模式下结果必定落盘。"""
     action = sys.argv[1] if len(sys.argv) > 1 else "auto"
@@ -1036,7 +1129,7 @@ def main():
 
 def _run(action):
     _start_budget(action)
-    known = ("auto", "silent", "growth", "silent-growth", "status", "claim", "all")
+    known = ("auto", "silent", "growth", "silent-poll", "silent-growth", "status", "claim", "all")
     if action not in known:
         emit({"result": "ERROR",
               "report": "未知命令：%s（可用：%s）" % (action, " / ".join(known))},
@@ -1084,44 +1177,27 @@ def _run(action):
     endpoint = ((session.get("auth") or {}).get("endpoint") or DEFAULT_ENDPOINT).rstrip("/")
 
     if action in ("auto", "silent"):
-        code, out = run_auto(headers, endpoint)
-        # 网络本就不可达时不必再跑成长中心的一串请求（每个都要重试+等待），也免得
-        # 汇报出"无可领取项"这种假的安心话
-        if out.get("result") in ("NETWORK", "TIMEOUT"):
-            out["growth"] = "网络不可达或时间预算耗尽，成长中心跳过"
-            out["growth_result"] = out["result"]
-            emit(out, action)
-            return code
-        # 签到后顺带跑成长中心；它出任何问题都不能吞掉签到已成功的事实
-        try:
-            gcode, gout = run_growth(headers, endpoint)
-        except Exception as e:
-            gcode, gout = 1, {"result": "ERROR",
-                              "report": "成长中心异常（%s: %s）" % (type(e).__name__, e)}
-        out["growth"] = gout.get("report")
-        out["growth_result"] = gout.get("result")
-        if gout.get("credits_gained"):
-            out["report"] += "；" + gout["report"]
-        # run_growth 只在"确有硬失败且一件都没成"时返回非 0（无可领取项、4xx 业务规则
-        # 均返回 0），直接透传即可——之前按 result 枚举漏了 result=GROWTH 的整体失败
-        if gcode != 0 and code == 0:
-            code = gcode
+        code, out, _ = run_daily(headers, endpoint)
         emit(out, action)
+        return code
+
+    if action in POLL_ACTIONS:
+        # 轮询 = 补签 + 成长中心，结果写日志文件（emit 按 silent 前缀判定落盘）。
+        # 早期版本这里只跑成长中心、刻意不碰签到接口，理由是"签到一天一次就够"；
+        # 但那样一来 00:05 那次一旦失败（关机/睡眠/刚开机网络没就绪），当天就再无
+        # 第二次机会。现在每次轮询都先查一次签到状态，未签才补——已签的代价只是
+        # 一个查询请求，换来的是一天七次机会。
+        # 空跑默认不落盘——一天要跑好几轮，全写进去只会把真正有价值的记录
+        # 淹没在一串"Buddy 旅行中"里。要看完整过程就设 WORKBUDDY_GROWTH_LOG_EMPTY=1。
+        code, out, quiet = run_daily(headers, endpoint)
+        out["trigger"] = "poll"
+        if (not quiet) or _env_flag("WORKBUDDY_GROWTH_LOG_EMPTY"):
+            emit(out, action)
         return code
 
     if action == "growth":
         code, out = run_growth(headers, endpoint)
         emit(out, action)
-        return code
-
-    if action == "silent-growth":
-        # 只跑成长中心，结果写日志文件（emit 按 silent 前缀判定落盘）。
-        # 不碰签到接口：签到一天一次就够，轮询没必要反复打它。
-        # 空跑默认不落盘——一天要跑好几轮，全写进去只会把真正有价值的记录
-        # 淹没在一串"Buddy 旅行中"里。要看完整过程就设 WORKBUDDY_GROWTH_LOG_EMPTY=1。
-        code, out = run_growth(headers, endpoint)
-        if (not out.get("idle")) or _env_flag("WORKBUDDY_GROWTH_LOG_EMPTY"):
-            emit(out, action)
         return code
 
     # 以下为交互式调试命令，输出原始返回。走 emit 而非 print，这样非法配置的

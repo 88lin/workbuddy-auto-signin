@@ -12,7 +12,7 @@
 #
 # 会创建两个定时任务：
 #   1) WorkBuddyAutoSignin   每天 00:05    签到 + 成长中心，静默写 signin.log
-#   2) WorkBuddyGrowthPoll   每 4 小时     只跑成长中心：领旅行礼物 / 派 Buddy / 领任务奖 / 连登兑换 / 抽奖
+#   2) WorkBuddyGrowthPoll   每 4 小时     补签（未签才签）+ 成长中心全套
 #
 # 两者都零 Token、无窗口、开机错过会自动补跑。
 
@@ -113,7 +113,7 @@ try {
         -Action $act1 -Trigger $tri1 -Settings $set1 -Principal $principal `
         -Description "WorkBuddy daily auto signin (silent, zero token)" -Force | Out-Null
 
-    # 任务 2：成长中心轮询（每天 01/05/09/13/17/21 点，共 6 次）
+    # 任务 2：轮询（每天 01/05/09/13/17/21 点，共 6 次）
     # 刻意用 6 个独立的 Daily 触发器，而不是"Daily + 每 4 小时重复"：
     # 实测后者的重复实例一旦错过（关机/睡眠）就永久跳过，StartWhenAvailable
     # 不会为它补跑——本机就出现过 05:00 跑完后 09/13 点直接跳到 17:00 的情况。
@@ -122,13 +122,17 @@ try {
     foreach ($hh in @("01:00", "05:00", "09:00", "13:00", "17:00", "21:00")) {
         $tri2 += New-ScheduledTaskTrigger -Daily -At $hh
     }
-    $act2 = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$signin`" silent-growth"
+    # 跑的是 silent-poll：先查签到状态、未签才补签，再跑成长中心。签到的机会因此
+    # 从"一天一次"变成"一天七次"——00:05 那次撞上关机/睡眠/刚开机网络没就绪时，
+    # 01 点那轮就能兜住，而不是眼睁睁断掉连签。（silent-growth 是它的旧名，
+    # 已经装过旧版计划任务的机器继续用那个名字也能跑，行为一致。）
+    $act2 = New-ScheduledTaskAction -Execute $pythonw -Argument "`"$signin`" silent-poll"
     $set2 = New-ScheduledTaskSettingsSet -StartWhenAvailable -Hidden `
             -DontStopIfGoingOnBatteries -AllowStartIfOnBatteries `
             -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
     Register-ScheduledTask -TaskName "WorkBuddyGrowthPoll" `
         -Action $act2 -Trigger $tri2 -Settings $set2 -Principal $principal `
-        -Description "WorkBuddy growth center poll (claim travel gift / dispatch Buddy)" -Force | Out-Null
+        -Description "WorkBuddy poll (catch-up signin + growth center)" -Force | Out-Null
 } catch {
     Write-Host " 失败" -ForegroundColor Red
     Write-Host ""
@@ -142,7 +146,7 @@ Write-Host ""
 Write-Host "两个定时任务已就位：" -ForegroundColor Green
 foreach ($row in @(
     @{ Name = "WorkBuddyAutoSignin"; When = "每天 00:05";  What = "签到 + 成长中心" },
-    @{ Name = "WorkBuddyGrowthPoll"; When = "每 4 小时";   What = "成长中心全套（礼物 · 兑换 · 抽奖）" }
+    @{ Name = "WorkBuddyGrowthPoll"; When = "每 4 小时";   What = "补签 + 成长中心全套" }
 )) {
     $t = Get-ScheduledTask -TaskName $row.Name
     $i = Get-ScheduledTaskInfo -TaskName $row.Name
