@@ -334,15 +334,32 @@ def _is_no_chance(msg):
 def _is_unknown_tier(code, body):
     """连登兑换是否因为"tier 这个值本身不认识"被拒——用于判断要不要换一种写法重试。
 
-    /redeem 实测收的是天数（7/14/28），档位名会得到 400 + `unknown tier`。但这一点
-    只在一台机器上验过，接口哪天要是改成只认档位名，脚本就会三档全废且看不出原因。
-    这类 400 是参数校验阶段的拒绝，服务端没兑换任何东西，换个写法重试是安全的；
-    `invalid request`（未解锁）这种业务拒绝不在此列，不能重试。
+    /redeem 的 tier 是**档位标识字符串**（"7d"/"14d"/"28d"），权威来源是
+    GET /streak 的 redemption_status.tiers[].tier。接口哪天改回收天数，脚本就会
+    三档全废且看不出原因，所以保留这条兜底：档位标识被判 unknown tier 时退回天数
+    再试一次。这类 400 发生在参数校验阶段，服务端没兑换任何东西，重试不会重复领取；
+    `invalid request` 这类业务拒绝不在此列，不能重试。
+
+    历史教训：2026-09-11 曾据"传天数返回 invalid request"误判 tier 要收数字，
+    导致兑换模块连坏三个版本——"业务拒绝"的错误文案不能反推参数格式正确，
+    必须拿到一次成功响应才算验证过。
     """
     if code != 400:
         return False
     m = str(dig(body, "msg") or "").lower()
-    return "tier" in m and ("unknown" in m or "invalid" in m or "unsupported" in m)
+    return "tier" in m and ("unknown" in m or "unsupported" in m or "invalid" in m)
+
+
+def _is_tier_locked(code, body):
+    """未解锁档位：403 + 「连续登录天数不足」——这是常态，不是故障。
+
+    不加这条的话，未解锁档位会被计进 failures，轮询每轮都判定"有失败"从而强制
+    落盘，真正有价值的记录会被这类常态信息淹没。
+    """
+    if code != 403:
+        return False
+    m = str(dig(body, "msg") or "")
+    return "天数不足" in m or "不足" in m
 
 
 def dig(obj, key):
@@ -434,21 +451,39 @@ def _client_token(prefix="u"):
 # 连登兑换各档奖励的官方文案（2026-09 活动版本）。兑换成功的汇报优先用
 # 服务端返回的实际明细，挖不到字段时才回落到这里——活动改版时以响应为准。
 _REDEEM_REWARDS = {
-    "starter":   "+2 能量 +1 补登卡 +1 次抽奖",
-    "advanced":  "+50 积分 +3 能量 +1 补登卡 +1 次抽奖",
-    "legendary": "+150 积分 +5 能量 +1 补登卡 +1 次抽奖",
+    "7d":  "+2 能量 +1 补登卡 +1 次抽奖",
+    "14d": "+50 积分 +3 能量 +1 补登卡 +1 次抽奖",
+    "28d": "+150 积分 +5 能量 +1 补登卡 +1 次抽奖",
 }
+
+# 连登兑换三档：(档位标识, /redeem/summary 的状态字段前缀, 展示名, 天数)
+# tier 的口径是档位标识字符串，天数只用于兜底重试时退回旧写法。
+_REDEEM_TIERS = (
+    ("7d",  "starter",   "入门", 7),
+    ("14d", "advanced",  "进阶", 14),
+    ("28d", "legendary", "巅峰", 28),
+)
 
 
 def _redeem_reward_desc(body, tier):
-    """兑换成功的奖励描述：能从响应里挖到积分/能量就拼实际值，否则用官方文案。"""
+    """兑换成功的奖励描述：优先拼服务端实发的 *_granted，挖不到才回落官方文案。
+
+    注意实发字段名带 _granted 后缀（credit_granted / energy_granted /
+    cards_granted / chances_granted）；直接读 `credit` 恒为空，会把兑换所得漏计。
+    """
     bits = []
-    credit = as_int(dig(body, "credit"), 0)
-    energy = as_int(dig(body, "energy"), 0)
+    credit = as_int(dig(body, "credit_granted"), 0)
+    energy = as_int(dig(body, "energy_granted"), 0)
+    cards = as_int(dig(body, "cards_granted"), 0)
+    chances = as_int(dig(body, "chances_granted"), 0)
     if credit:
         bits.append("+%s 积分" % fmt_credit(credit))
     if energy:
         bits.append("+%s 能量" % fmt_credit(energy))
+    if cards:
+        bits.append("+%s 补登卡" % fmt_credit(cards))
+    if chances:
+        bits.append("+%s 次抽奖" % fmt_credit(chances))
     if bits:
         return "（%s）" % " ".join(bits)
     return "（%s）" % _REDEEM_REWARDS.get(tier, "奖励已到账")
@@ -812,17 +847,16 @@ def run_growth(headers, endpoint):
                 return 1, {"result": "NO_SESSION",
                            "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
             if not _note_http(rcode, rbody, "查连登兑换"):
-                # tier 传「天数」：实测传 "starter" 这类档位名直接 400 unknown tier，
-                # 传 7/14/28 才被识别（未解锁时回 invalid request，那才是业务拒绝）。
-                # 档位名只用于读 *_status 字段和展示文案。
-                # 这一点只在一台机器上验过，接口若改成只认档位名，下面有兜底重试。
-                for tier, label, days in (("starter", "入门", 7),
-                                          ("advanced", "进阶", 14),
-                                          ("legendary", "巅峰", 28)):
+                # tier 传**档位标识**（"7d"/"14d"/"28d"），不是天数也不是档位名：
+                # 实测传 "starter"/"7"/7 分别得到 unknown tier / unknown tier /
+                # invalid request，只有 "7d" 会 200 兑换成功。权威来源是 GET /streak
+                # 的 redemption_status.tiers[].tier；状态字段仍读 /redeem/summary
+                # 的 starter/advanced/legendary_status，两者一一对应。
+                for tier, status_key, label, days in _REDEEM_TIERS:
                     if _budget_left() <= 0:
                         parts.append("时间预算耗尽，剩余连登兑换下次再领")
                         break
-                    status = dig(rbody, tier + "_status")
+                    status = dig(rbody, status_key + "_status")
                     # 字段缺失（None）同样跳过：接口改版时不该让脚本对三档无脑 POST。
                     # 注意别在这里再加 *_count 之类的"双保险"：实测响应里
                     # starter_count=1 与 total_consumed=0 并存，count 到底是
@@ -830,17 +864,23 @@ def run_growth(headers, endpoint):
                     if not status or status in ("claimed", "locked"):
                         continue
                     c2code, c2body = post(base + "/redeem", headers,
-                                          {"tier": days, "client_token": _client_token()})
-                    # 天数被判为未知档位时退回档位名再试一次：这类 400 是参数校验阶段
+                                          {"tier": tier, "client_token": _client_token()})
+                    # 档位标识被判为未知时退回天数再试一次：这类 400 是参数校验阶段
                     # 的拒绝，服务端没兑换任何东西，重试不会重复领取
                     if _is_unknown_tier(c2code, c2body):
                         c2code, c2body = post(base + "/redeem", headers,
-                                              {"tier": tier, "client_token": _client_token()})
+                                              {"tier": days, "client_token": _client_token()})
+                    # 403「连登天数不足」是业务常态，必须**先于** _check_auth 判断：
+                    # _check_auth 把 401/403 一律视为登录失效，若让它先跑，未解锁档位
+                    # 会被误报成"登录态已失效"并直接中止整个成长中心。
+                    if _is_tier_locked(c2code, c2body):
+                        parts.append("连登兑换「%s」未解锁（连登天数不足）" % label)
+                        continue
                     if _check_auth(c2code):
                         return 1, {"result": "NO_SESSION",
                                    "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
                     if 200 <= c2code < 300:
-                        credits_gained += as_int(dig(c2body, "credit"))
+                        credits_gained += as_int(dig(c2body, "credit_granted"))
                         parts.append("连登兑换「%s」%s" % (label, _redeem_reward_desc(c2body, tier)))
                         successes += 1
                     else:
