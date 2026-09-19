@@ -663,59 +663,75 @@ def run_growth(headers, endpoint):
                            "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
             if not _note_http(tcode, tbody, "查任务列表"):
                 tasks = dig(tbody, "tasks") or []
-                for t in tasks:
+                # 真实契约（2026-09 从桌面端成长中心 H5 的 growthSpace chunk 读出）：
+                #   accept_status: not_accepted | accepted | in_progress | completed | claimed
+                #   接单 POST /tasks/accept  body {"task_codes": [code, ...]}   ← 复数数组
+                #        （旧的单数 {"task_code": x} 在新服务端一律 400 invalid request）
+                #   领奖 POST /tasks/{task_code}/claim   ← 路径带 code、body 空
+                #        （旧版拿 /tasks/accept 当领奖用，同样 400）
+                titles = {t.get("task_code"): t.get("title", t.get("task_code")) for t in tasks}
+                pending = [t.get("task_code") for t in tasks
+                           if t.get("task_code") and not t.get("locked")
+                           and t.get("accept_status") == "not_accepted"]
+                for i in range(0, len(pending), 20):   # 分批，别把 body 撑大
                     if _budget_left() <= 0:
-                        parts.append("时间预算耗尽，剩余任务下次再领")
+                        parts.append("时间预算耗尽，剩余任务下次再接单")
                         break
-                    try:
-                        # accept_status 三态：None/"" 未领取 · "accepted" 已领取进行中 · "claimed" 已领奖。
-                        # 官方规则：进度从"领取任务"那一刻才开始计，领取前的使用行为不算。
-                        # 所以除了领奖，还得替用户把新出现的任务领下来，否则它永远完不成。
-                        status = t.get("accept_status")
-                        if status == "claimed" or t.get("locked"):
-                            continue
-                        prog = t.get("progress") or {}
-                        target = as_int(prog.get("target"), 1) or 1  # target 为 0/缺失时按 1 处理，避免误判已完成
-                        done = as_int(prog.get("current")) >= target
-                        if not done and status:
-                            continue  # 已领取、还没做完——等用户完成，别重复领取
-                        # claiming=True 才是"领奖"：已领取过 + 已完成。未领取的任务即使
-                        # 进度显示已达标也只当"领取"，因为这一 POST 大概率只是接单而非发奖，
-                        # 按领奖上报会把没到账的积分算进 credits_gained；下一轮再正常领奖。
-                        claiming = bool(done and status)
-                        # 不再拿 has_reward 做前置条件：实测 16 个任务全部为 true，连 14 个
-                        # 已 claimed 的也是——它是"该任务设有奖励"的静态属性，不是"有待领取的
-                        # 奖励"。用它拦截只会把 has_reward=false 却真有奖励的任务永久漏掉。
-                        acode, abody = post(base + "/tasks/accept", headers,
-                                            {"task_code": t.get("task_code")})
-                        if _check_auth(acode):
-                            return 1, {"result": "NO_SESSION",
-                                       "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
-                        title = t.get("title", t.get("task_code"))
-                        if 200 <= acode < 300:
-                            if claiming:
-                                # 优先用服务端实际发放的数值；列表里的 reward_credit
-                                # 只是活动配置，改版时会和实发对不上（旅行礼物、连登兑换
-                                # 都已按响应值上报，这里保持一致）。挖不到才回落到列表值。
-                                rc = _first_int(abody, "credit", t.get("reward_credit"))
-                                re_ = _first_int(abody, "energy", t.get("reward_energy"))
-                                credits_gained += rc
-                                parts.append("领任务奖「%s」+credit%s+energy%s" % (title, rc, re_))
-                            else:
-                                parts.append("领取任务「%s」（进度开始计）" % title)
-                            successes += 1
-                        else:
-                            # 失败必须记：这个 POST 现在每轮都会为未领取的任务发一次，
-                            # 静默吞掉就等于接口坏了也没人知道（轮询下空跑是不写日志的）
-                            msg = dig(abody, "msg") or ""
-                            parts.append("%s「%s」失败：%s" % (
-                                "领任务奖" if claiming else "领取任务",
-                                title, msg or "HTTP %s" % acode))
+                    batch = pending[i:i + 20]
+                    acode, abody = post(base + "/tasks/accept", headers,
+                                        {"task_codes": batch})
+                    if _check_auth(acode):
+                        return 1, {"result": "NO_SESSION",
+                                   "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
+                    # 逐条读 results：接单失败必须报出来（常见
+                    # "prerequisite not met: first_buddy (no buddy instance found)"），
+                    # 静默吞掉的话接口坏了也没人知道——轮询空跑是不写日志的。
+                    results = dig(abody, "results")
+                    if not isinstance(results, list):
+                        results = [{"task_code": c,
+                                    "status": "ok" if 200 <= acode < 300 else "error",
+                                    "message": dig(abody, "msg")} for c in batch]
+                    for r in results:
+                        title = titles.get(r.get("task_code"), r.get("task_code"))
+                        if r.get("status") == "error":
+                            parts.append("领取任务「%s」失败：%s" % (
+                                title, r.get("message") or "HTTP %s" % acode))
                             failures += 1
                             hard_failures += _is_hard_failure(acode)
+                        else:
+                            parts.append("领取任务「%s」（进度开始计）" % title)
+                            successes += 1
+                for t in tasks:
+                    if _budget_left() <= 0:
+                        parts.append("时间预算耗尽，剩余任务奖下次再领")
+                        break
+                    if t.get("locked") or t.get("accept_status") != "completed":
+                        continue   # 只有 completed 才发奖，且走独立路径
+                    code = t.get("task_code")
+                    title = titles.get(code, code)
+                    try:
+                        ccode, cbody = post(base + "/tasks/%s/claim" % code, headers, {})
+                        if _check_auth(ccode):
+                            return 1, {"result": "NO_SESSION",
+                                       "report": "登录态已失效，请重新登录 WorkBuddy 桌面端"}
+                        if 200 <= ccode < 300 and not dig(cbody, "already_claimed"):
+                            # 优先用服务端实发数值；列表里的 reward_credit 只是活动配置，
+                            # 改版时会和实发对不上，挖不到才回落到列表值。
+                            rc = _first_int(cbody, "credit", t.get("reward_credit"))
+                            re_ = _first_int(cbody, "energy", t.get("reward_energy"))
+                            credits_gained += rc
+                            parts.append("领任务奖「%s」+credit%s+energy%s" % (title, rc, re_))
+                            successes += 1
+                        elif 200 <= ccode < 300:
+                            parts.append("任务奖「%s」已领过" % title)
+                        else:
+                            parts.append("领任务奖「%s」失败：%s" % (
+                                title, dig(cbody, "msg") or "HTTP %s" % ccode))
+                            failures += 1
+                            hard_failures += _is_hard_failure(ccode)
                     except Exception as e:
-                        parts.append("任务「%s」异常（%s: %s）" % (
-                            t.get("task_code", "?"), type(e).__name__, e))
+                        parts.append("领任务奖「%s」异常（%s: %s）" % (
+                            code, type(e).__name__, e))
                         failures += 1
                         hard_failures += 1
         except Exception as e:
