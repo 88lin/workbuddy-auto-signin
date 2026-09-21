@@ -32,11 +32,16 @@ WORKBUDDY_AUTH_FILE 指定。任何模式下都不会打印令牌，可安全分
   python signin.py all            # 查签到状态 + 领取（调试）
 """
 
+import base64
+import hashlib
 import json
 import math
 import os
 import ssl
+import struct
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -185,6 +190,143 @@ def load_session_retry(auth_file, attempts=3, delay=2.0):
             if i < attempts - 1:
                 time.sleep(delay)
     raise last
+
+
+# ============ WorkBuddy 5.6.0+ 信封加密凭据解密 ============
+# 5.6.0 起桌面端把 auth.accessToken / auth.refreshToken 从明文字符串改成了
+# {"$wbEncrypted": 1, "envelope": "<base64(JSON)>"} 信封。信封用 AES-256-GCM 加密，
+# 密钥由桌面端二进制内嵌的 build key 派生，只能通过 Electron 原生 binding 取出；
+# 这里按官方 at-rest-crypto 的 sym-v1 字段级 AAD 构造就地解密，明文只留在内存里，
+# 不落盘（避免把令牌以明文写回磁盘，破坏客户端加密封装的本意）。
+
+
+class EnvelopeUnsupportedError(Exception):
+    """信封凭据无法解密：缺少桌面端、密钥不匹配或 GCM 认证失败。"""
+
+    def __init__(self, reason="", key_id=None):
+        super().__init__(reason)
+        self.reason = reason
+        self.key_id = key_id
+
+
+def _find_workbuddy_exe():
+    """定位 WorkBuddy 桌面端可执行文件；找不到返回 None。"""
+    candidates = []
+    override = os.environ.get("WORKBUDDY_EXE")
+    if override:
+        candidates.append(override)
+    program_files = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    local = os.environ.get("LOCALAPPDATA") or ""
+    candidates.extend([
+        os.path.join(program_files, "WorkBuddy", "WorkBuddy.exe"),
+        os.path.join(local, "Programs", "WorkBuddy", "WorkBuddy.exe"),
+    ])
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _fetch_build_key_payload(exe):
+    """借 Electron 原生 binding 取出编译期 build key payload。
+
+    桌面端是 GUI 子系统程序，ELECTRON_RUN_AS_NODE=1 下 stdout 不挂到控制台，
+    所以让 Node 直接把结果写进临时文件，再由本进程读回。
+    """
+    script = ("const fs = require('fs');"
+              "const n = process._linkedBinding('electron_browser_workbuddy_storage');"
+              "fs.writeFileSync(process.env.WB_KEY_OUT, n.loggerGet());")
+    fd, tmp = tempfile.mkstemp(prefix="wb-key-", suffix=".json")
+    os.close(fd)
+    try:
+        env = dict(os.environ, ELECTRON_RUN_AS_NODE="1", WB_KEY_OUT=tmp)
+        subprocess.run([exe, "-e", script], env=env, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        with open(tmp, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        raise EnvelopeUnsupportedError(reason="无法调用 WorkBuddy 原生存储接口取出解密密钥")
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    if not isinstance(payload, dict) or not isinstance(payload.get("atRestSecretKey"), str):
+        raise EnvelopeUnsupportedError(reason="build key payload 缺少 atRestSecretKey")
+    return payload
+
+
+def _build_field_aad(key_id, suite):
+    """构造 sym-v1 字段级（framing=field）AAD，与官方 at-rest-crypto 逐字节一致。"""
+
+    def _lp(text):
+        raw = text.encode("utf-8")
+        return struct.pack(">I", len(raw)) + raw
+
+    aad = b"WB-AAD\x00"          # AAD_DOMAIN
+    aad += b"\x01"               # version
+    aad += _lp("WBEV1")          # STANDARD_FORMAT_ID["field"]
+    aad += _lp("sym-v1")         # scheme
+    aad += struct.pack(">I", suite)
+    aad += _lp(key_id)
+    aad += b"\x02"               # FRAMING_CODE["field"]
+    aad += b"\x00"               # encodeOptionalUint64(undefined)
+    aad += b"\x00"               # final === undefined
+    return aad
+
+
+def _decrypt_one_envelope(value, protector_key):
+    """解密单个信封字段，返回明文字符串。"""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except Exception:
+        raise EnvelopeUnsupportedError(reason="缺少 cryptography 库，无法解密信封凭据")
+    try:
+        inner = json.loads(base64.b64decode(value["envelope"]).decode("utf-8"))
+    except Exception:
+        raise EnvelopeUnsupportedError(reason="信封内容不是合法的 base64 JSON")
+    key_id = inner.get("keyId")
+    if not isinstance(key_id, str) or len(key_id) != 16:
+        raise EnvelopeUnsupportedError(reason="信封 keyId 非法")
+    if key_id != hashlib.sha256(protector_key).hexdigest()[:16]:
+        raise EnvelopeUnsupportedError(key_id=key_id, reason="信封 keyId 与本地密钥不匹配")
+    try:
+        nonce = base64.b64decode(inner["nonce"])
+        ciphertext = base64.b64decode(inner["ciphertext"])
+        auth_tag = base64.b64decode(inner["authTag"])
+        plaintext = AESGCM(protector_key).decrypt(
+            nonce, ciphertext + auth_tag, _build_field_aad(key_id, inner["suite"]))
+    except Exception:
+        raise EnvelopeUnsupportedError(key_id=key_id, reason="信封解密失败（GCM 认证未通过）")
+    return plaintext.decode("utf-8")
+
+
+def _unwrap_enveloped_tokens(session):
+    """若凭据是信封加密，就地解密 accessToken / refreshToken，返回新会话 dict。
+
+    非信封（旧版客户端 / 明文缓存文件）原样返回，零开销。任一字段解密失败都会
+    抛出 EnvelopeUnsupportedError，由调用方转成与 NO_SESSION 区分开的错误码。
+    """
+    auth = session.get("auth")
+    if not isinstance(auth, dict):
+        return session
+    enveloped = [name for name in ("accessToken", "refreshToken")
+                 if isinstance(auth.get(name), dict)
+                 and auth[name].get("$wbEncrypted") == 1]
+    if not enveloped:
+        return session
+    exe = _find_workbuddy_exe()
+    if not exe:
+        raise EnvelopeUnsupportedError(reason="本机未找到 WorkBuddy 桌面端，无法解密信封凭据")
+    protector_key = hashlib.sha256(
+        _fetch_build_key_payload(exe)["atRestSecretKey"].encode("utf-8")
+    ).digest()
+    new_auth = dict(auth)
+    for name in enveloped:
+        new_auth[name] = _decrypt_one_envelope(auth[name], protector_key)
+    new_session = dict(session)
+    new_session["auth"] = new_auth
+    return new_session
 
 
 def build_headers(session):
@@ -1230,6 +1372,18 @@ def _run(action):
               "report": "读取登录凭据失败（%s: %s），请重新登录 WorkBuddy 桌面端" % (type(e).__name__, e)},
              action)
         return 2
+
+    # 5.6.0+ 的信封凭据先就地解密；失败给独立的错误码，方便与"登录过期"区分诊断
+    try:
+        session = _unwrap_enveloped_tokens(session)
+    except EnvelopeUnsupportedError as e:
+        out = {"result": "ENVELOPE_UNSUPPORTED",
+               "report": "凭据为信封加密但无法解密：%s" % e.reason}
+        if e.key_id:
+            out["key_id"] = e.key_id
+            out["report"] += "（keyId=%s）" % e.key_id
+        emit(out, action)
+        return 1
 
     try:
         headers = build_headers(session)
