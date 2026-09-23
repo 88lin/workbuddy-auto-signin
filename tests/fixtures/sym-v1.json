@@ -1,0 +1,20 @@
+{
+  "description": "Synthetic fixture generated independently with Python cryptography AESGCM; no real client material. AAD checked against the client field framing.",
+  "build_payload": {
+    "version": 1,
+    "atRestSecretKey": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+  },
+  "aad_hex": "57422d41414400010000000557424556310000000673796d2d7631000000010000001034633266663536626538376263633333020000",
+  "token": "synthetic-access-token.for-tests",
+  "envelope": {
+    "suite": 1,
+    "keyId": "4c2ff56be87bcc33",
+    "nonce": "AAECAwQFBgcICQoL",
+    "authTag": "hSZezIBMQdAt+LR54FXn+A==",
+    "ciphertext": "SEDabbOkh+4x2ZzSEPnxV0PZa6rwV/ldvKtGni5efgk="
+  },
+  "wrapper": {
+    "$wbEncrypted": 1,
+    "envelope": "eyJzdWl0ZSI6MSwia2V5SWQiOiI0YzJmZjU2YmU4N2JjYzMzIiwibm9uY2UiOiJBQUVDQXdRRkJnY0lDUW9MIiwiYXV0aFRhZyI6ImhTWmV6SUJNUWRBdCtMUjU0RlhuK0E9PSIsImNpcGhlcnRleHQiOiJTRURhYmJPa2grNHgyWnpTRVBueFYwUFphNnJ3Vi9sZHZLdEduaTVlZmdrPSJ9"
+  }
+}
