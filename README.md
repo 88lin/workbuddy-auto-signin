@@ -56,14 +56,14 @@
 
 | | 特性 |
 |:---:|---|
-| ✨ | **零依赖** —— 纯 Python 标准库，不用 `pip install`，任意 Python 3 即可 |
+| ✨ | **无需额外安装依赖** —— Python 标准库 + 本机 WorkBuddy 自带运行时，不用 `pip install` 或另装 Node；明文凭据只用 Python |
 | 📦 | **单文件** —— 完全自包含 |
 | ♻️ | **幂等安全** —— 先查状态，未签才领；重复运行不会多领 |
 | 🐱 | **成长中心** —— 自动领旅行礼物、派 Buddy、领取新任务、领任务奖、断登自动补登、连登奖励兑换、开盲盒抽奖、能量开 Buddy 盲盒 |
 | 🐾 | **成长中心轮询** —— 定时方案自带（Win 一键安装 / macOS 模板）：Buddy 一回来就领礼物并补派，把每日名额用满，不让礼物压到第二天 |
 | ⏰ | **双定时模式** —— AI 自动化（跨平台）或系统级静默（Win / macOS，零 token） |
 | 📣 | **智能汇报** —— 一行 JSON，如 `成功领取 100 积分（连续 7 天，累计 700 积分）` |
-| 💪 | **健壮** —— 兼容「已签」两种返回形态、识别 401/403 登录态过期、识别非签到季 |
+| 💪 | **健壮** —— 兼容明文与受支持的加密凭据，区分格式错误、认证拒绝、权限限制及非签到季 |
 | 🌍 | **跨平台** —— 自动探测 Windows / macOS / Linux 凭据文件 |
 | 🔐 | **无密钥** —— 仓库不含任何密钥，只读取运行者本机登录凭据 |
 
@@ -120,7 +120,7 @@ cd workbuddy-auto-signin
   ```text
   运行 <python> <signin.py 的绝对路径> auto，
   把命令输出的 JSON 里 report 字段的内容，直接一句话汇报给我。
-  若 report 含"领取失败""登录态已失效""未找到登录凭据"或"网络不可达"，额外提醒我处理。
+  若 JSON 的 needs_attention 为 true 或命令退出码非 0，额外提醒我处理。
   ```
 
 > [!NOTE]
@@ -273,6 +273,7 @@ python signin.py growth         # 仅成长中心（不签到）
 python signin.py silent-poll    # 轮询：补签（未签才签）+ 成长中心，空跑不写日志（配合模式 B 的轮询任务）
 python signin.py silent-growth  # silent-poll 的旧名，行为完全相同（老计划任务仍可用）
 python signin.py status         # 仅查签到状态（调试）
+python signin.py doctor         # 离线检查凭据格式及运行时能力，不解密、不联网
 python signin.py claim          # 仅领取签到（调试，幂等）
 python signin.py all            # 查签到状态 + 领取（调试）
 ```
@@ -283,7 +284,18 @@ python signin.py all            # 查签到状态 + 领取（调试）
 
 ## ⚙️ 工作原理
 
-登录后，WorkBuddy 桌面端写出明文 JSON 会话文件 `workbuddy-desktop.info`（含 `accessToken`）。脚本流程：
+登录后，WorkBuddy 桌面端写出 JSON 会话文件 `workbuddy-desktop.info`。旧版本的 `accessToken` 是明文字符串，新版本可能为 `$wbEncrypted` 字段信封。脚本先校验格式；受支持的 `sym-v1 / suite 1` 信封由本机客户端自带的运行时在隐藏子进程中解密，只通过内存管道返回 access token。脚本不处理 refresh token，登录及续期仍由客户端负责。
+
+| 凭据来源 | 支持情况 |
+|---|---|
+| Windows / macOS 旧明文、Linux CodeBuddy CLI 明文 | 保留原路径，无需客户端解密运行时 |
+| Windows 新版字段加密 | 支持 `sym-v1 / suite 1`；5.6.2 已进行本机验证，其他版本按格式与运行时能力检测 |
+| macOS 新版字段加密 | 已实现 `.app` 可执行文件发现及同一管道协议；尚待客户端实机验证 |
+| 其他加密格式或不具备原生存储接口的运行时 | 明确返回 `AUTH_ERROR`，不发送无效令牌 |
+
+客户端升级可能改变私有接口或格式。先运行 `python signin.py doctor` 检查本地能力，再运行只读的 `python signin.py status` 验证服务端认证；`doctor` 成功不表示解密或服务端认证已验证。
+
+签到流程：
 
 1. 📂 **定位**凭据文件（自动探测，或用 `WORKBUDDY_AUTH_FILE` 覆盖）
 2. 🔍 **查询** `POST /v2/billing/meter/checkin-activity-status` —— 今天是否已领？
@@ -303,6 +315,7 @@ python signin.py all            # 查签到状态 + 领取（调试）
 | 环境变量 | 作用 |
 |---|---|
 | `WORKBUDDY_AUTH_FILE` | 自动探测失败时，手动指定凭据文件路径 |
+| `WORKBUDDY_EXE` | 指定与加密凭据对应的客户端**可执行文件**；Windows 为 `WorkBuddy.exe`，macOS 为 `.app/Contents/MacOS/` 内实际可执行文件。路径错误时直接报告，不静默回退 |
 | `WORKBUDDY_SIGNIN_LOG` | `silent` 模式下日志文件路径（默认 `signin.log`） |
 | `WORKBUDDY_BUDGET_SECONDS` | 单次运行的网络请求时间预算。签到类命令默认 `420`（7 分钟）、上限 `540`；`silent-poll` / `silent-growth` 轮询默认 `180`、上限 `240`。**Windows 上须为正数且小于对应计划任务的 `ExecutionTimeLimit`**（macOS launchd 无此限制）。非法值、`≤0` 或超上限都会夹到安全值，并在输出里附 `config_warning` |
 | `WORKBUDDY_GROWTH_LOG_EMPTY` | 设为 `1`（或 `true`/`yes`/`on`）时，`silent-poll` 连空跑也写日志；默认只在领到东西或出错时记录 |
@@ -322,7 +335,15 @@ python signin.py all            # 查签到状态 + 领取（调试）
 |---|---|
 | `NO_AUTH / 未找到登录凭据` | 先登录一次 WorkBuddy 桌面端（Linux 则是 CodeBuddy CLI）；或设置 `WORKBUDDY_AUTH_FILE` |
 | `NO_AUTH / WORKBUDDY_AUTH_FILE 指向的文件不存在` | 环境变量路径写错了——核对 `looked_in` 字段里的实际路径 |
-| `NO_SESSION / HTTP 401\|403` | 登录态过期——重新登录桌面端，自动化自动恢复 |
+| `NO_SESSION` | 本地缺少登录会话或必要字段，请先登录客户端 |
+| `AUTH_ERROR / INVALID_FORMAT` | 凭据结构或令牌格式无效；先检查凭据来源和客户端版本 |
+| `AUTH_ERROR / UNSUPPORTED_ENVELOPE` | 加密格式尚不支持，请更新脚本；反复重新登录不会解决格式不兼容 |
+| `AUTH_ERROR / RUNTIME_NOT_FOUND` 或 `INVALID_RUNTIME_PATH` | 检查客户端安装位置，设置正确的 `WORKBUDDY_EXE` |
+| `AUTH_ERROR / RUNTIME_UNAVAILABLE` 或 `HELPER_PROTOCOL` | 所选运行时不具备所需能力或返回无效结果，请检查客户端和脚本版本 |
+| `AUTH_ERROR / KEY_MISMATCH` 或 `DECRYPT_FAILED` | 检查所选客户端是否与凭据匹配，以及凭据是否完整；多版本安装可用 `WORKBUDDY_EXE` 明确选择 |
+| `AUTH_ERROR / HELPER_TIMEOUT` | 凭据助手超时并已停止，稍后重试或检查运行时 |
+| `AUTH_REJECTED / HTTP 401` | 服务端拒绝认证；检查客户端登录状态、凭据对应的服务地址及脚本版本，不能仅凭 401 断言过期 |
+| `FORBIDDEN / HTTP 403` | 服务端拒绝操作，检查账号权限或活动条件；已知“兑换档位未解锁”仍按正常业务状态处理 |
 | `INACTIVE / 签到活动未开启` | 非签到季，属正常，无需处理 |
 | `NETWORK / 网络不可达` | 断网或服务端不可用，**非**登录问题。脚本内置退避重试（5/15/30/60/90 秒，受时间预算约束），跨得过"刚开机网络还没就绪"那几十秒；仍失败就等下一次运行 |
 | `TIMEOUT / 已达本次运行时间预算` | 网络严重超时导致预算耗尽，已领到的部分照常记录，剩余项下次再领 |
@@ -335,7 +356,7 @@ python signin.py all            # 查签到状态 + 领取（调试）
 | 调试原始返回 | `python signin.py status` 或 `python signin.py all` |
 
 > [!IMPORTANT]
-> 登录态失效时脚本会明确返回 `NO_SESSION` 并提醒重新登录桌面端；重新登录后自动化无需任何改动即自动恢复。
+> 需要处理的结果会附 `needs_attention: true`；静默模式也会记录认证错误。`status` / `claim` / `all` 请求失败返回非零退出码，`all` 的状态查询失败时不会继续领取。
 
 ---
 
@@ -343,6 +364,8 @@ python signin.py all            # 查签到状态 + 领取（调试）
 
 - 脚本只读取**你自己本机**的 WorkBuddy 会话文件，不含、不内嵌、不传输任何第三方密钥
 - 永远不会打印 `accessToken`，`Authorization` 头不会出现在日志里
+- 加密路径的密钥只在短生命周期的客户端子进程内使用；不写临时密钥文件、不缓存明文 token、不改写原凭据
+- 凭据助手有独立超时及管道大小限制，受本次运行总时间预算约束；原始助手输出不进入日志
 - 可安全 fork、分享、在自己机器上运行——它只作用于**你自己的**登录态
 
 ---
