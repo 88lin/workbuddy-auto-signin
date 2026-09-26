@@ -25,10 +25,10 @@
 
 <table>
 <tr>
-  <td width="180" align="center" valign="middle">
-    <a href="https://agentmore.chatglm.cn?Rawcode=PM9UPGFZAX8M"><img src="https://sfile.chatglm.cn/workspace/image/1c/1c83b94683.png" alt="AgentMore" width="150"></a>
-  </td>
-  <td valign="middle"><b><a href="https://agentmore.chatglm.cn?Rawcode=PM9UPGFZAX8M">AgentMore</a></b>&nbsp;是智谱清言官方的多 Agent 云端协作平台，云端 7×24 小时运行、多任务并行，轻松组建专属 Agent 团队，可用GLM-5.3、GLM-5.3-Flash。双节活动期间（9月25日-10月7日）登录积分 ×10，普通用户日领2000积分，花出去的积分 100% 原路返还，单账号最多回血 15 万积分！</td>
+<td width="180" align="center" valign="middle">
+  <a href="https://agentmore.chatglm.cn?Rawcode=PM9UPGFZAX8M"><img src="https://sfile.chatglm.cn/workspace/image/1c/1c83b94683.png" alt="AgentMore" width="150"></a>
+</td>
+<td valign="middle"><b><a href="https://agentmore.chatglm.cn?Rawcode=PM9UPGFZAX8M">AgentMore</a></b>&nbsp;是智谱清言官方的多 Agent 云端协作平台，云端 7×24 小时运行、多任务并行，轻松组建专属 Agent 团队，可用GLM-5.3、GLM-5.3-Flash。双节活动期间（9月25日-10月7日）登录积分 ×10，普通用户日领2000积分，花出去的积分 100% 原路返还，单账号最多回血 15 万积分！</td>
 </tr>
 <tr>
 <td width="180" align="center" valign="middle">
