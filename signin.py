@@ -36,6 +36,7 @@ WORKBUDDY_AUTH_FILE 指定。任何模式下都不会打印令牌，可安全分
 import base64
 import json
 import math
+import ntpath
 import os
 import plistlib
 import re
@@ -48,6 +49,7 @@ import urllib.error
 import urllib.request
 import urllib.parse
 import uuid
+from contextlib import closing
 from datetime import datetime
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
@@ -317,6 +319,88 @@ def _mac_runtime(bundle):
         return None
 
 
+def _registry_text(registry, key, field):
+    """Read only string registry values; expand REG_EXPAND_SZ using Windows."""
+    try:
+        value, kind = registry.QueryValueEx(key, field)
+        if not isinstance(value, str) or kind not in (registry.REG_SZ, registry.REG_EXPAND_SZ):
+            return None
+        if kind == registry.REG_EXPAND_SZ:
+            value = registry.ExpandEnvironmentStrings(value)
+        return value
+    except OSError:
+        return None
+
+
+def _registry_runtime_path(value, icon=False):
+    """Parse a directory or DisplayIcon; never interpret an uninstall command."""
+    if not isinstance(value, str) or re.search(r"[\x00-\x1f\x7f]", value):
+        return None
+    value = value.strip()
+    if value.startswith('"'):
+        suffix = r"(?:\s*,\s*-?\d+)?" if icon else ""
+        match = re.fullmatch(r'"([^"]+)"' + suffix, value)
+        if not match:
+            return None
+        value = match[1]
+    elif '"' in value:
+        return None
+    elif icon:
+        # Only remove the trailing resource index; commas can belong to folders.
+        value = re.sub(r",\s*-?\d+$", "", value).rstrip()
+    if not ntpath.splitdrive(value)[0] or not ntpath.isabs(value):
+        return None
+    if not icon:
+        value = ntpath.join(value, "WorkBuddy.exe")
+    value = ntpath.normpath(value)
+    if ntpath.basename(value).casefold() != "workbuddy.exe":
+        return None
+    return value
+
+
+def _windows_registry_runtimes():
+    """Yield existing clients from user/machine uninstall entries, lazily.
+
+    Keep the import and all platform-specific constants inside this Windows-only
+    fallback so importing the script on macOS/Linux needs no winreg module.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import winreg
+    except ImportError:
+        return
+    subkey = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    seen = set()
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                with winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ | view) as root:
+                    count = winreg.QueryInfoKey(root)[0]
+                    for index in range(count):
+                        try:
+                            with winreg.OpenKey(root, winreg.EnumKey(root, index),
+                                                0, winreg.KEY_READ | view) as entry:
+                                name = _registry_text(winreg, entry, "DisplayName")
+                                if not name or not re.fullmatch(
+                                        r"WorkBuddy(?:\s+\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?)?",
+                                        name.strip(), re.IGNORECASE):
+                                    continue
+                                # A stale InstallLocation must not mask a valid DisplayIcon.
+                                for field in ("InstallLocation", "DisplayIcon"):
+                                    path = _registry_runtime_path(
+                                        _registry_text(winreg, entry, field), icon=field == "DisplayIcon")
+                                    if path and ntpath.normcase(path) not in seen:
+                                        seen.add(ntpath.normcase(path))
+                                        if os.path.isfile(path):
+                                            yield path
+                        except OSError:
+                            # Deleted entries and access-denied subkeys are normal.
+                            continue
+            except OSError:
+                continue
+
+
 def find_workbuddy_runtime():
     override = os.environ.get("WORKBUDDY_EXE")
     if override:
@@ -338,6 +422,11 @@ def find_workbuddy_runtime():
     for path in candidates:
         if path and os.path.isfile(path) and (os.name == "nt" or os.access(path, os.X_OK)):
             return os.path.abspath(path)
+    if sys.platform == "win32":
+        with closing(_windows_registry_runtimes()) as entries:
+            registered = next(entries, None)
+        if registered:
+            return registered
     raise AuthError("RUNTIME_NOT_FOUND")
 
 
