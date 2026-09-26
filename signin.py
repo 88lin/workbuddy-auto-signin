@@ -49,6 +49,8 @@ import urllib.request
 import urllib.parse
 import uuid
 from datetime import datetime
+if sys.platform == "win32":
+    import winreg
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
 AUTH_BASENAME = os.path.join("CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info")
@@ -317,6 +319,64 @@ def _mac_runtime(bundle):
         return None
 
 
+
+
+
+def _reg_str(key, field):
+    try:
+        return winreg.QueryValueEx(key, field)[0]
+    except OSError:
+        return None
+
+
+def _reg_entries():
+    roots = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+        (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+    ]
+    for hkey, sub in roots:
+        try:
+            key = winreg.OpenKey(hkey, sub)
+        except OSError:
+            continue
+        with key:
+            for i in range(winreg.QueryInfoKey(key)[0]):
+                try:
+                    with winreg.OpenKey(key, winreg.EnumKey(key, i)) as child:
+                        yield child
+                except OSError:
+                    continue
+
+
+def _exe_from_reg_entry(child, name):
+    disp = _reg_str(child, "DisplayName")
+    if not disp or name.lower() not in disp.lower():
+        return None
+
+    loc = _reg_str(child, "InstallLocation")
+    if loc:
+        exe = os.path.join(loc.strip().strip('"'), name + ".exe")
+        if os.path.exists(exe):
+            return exe
+
+    # DisplayIcon 可能指向 .ico 或已删除路径，必须验证
+    icon = _reg_str(child, "DisplayIcon")
+    if icon:
+        val = icon.split(",")[0].strip().strip('"')
+        if val.lower().endswith(".exe") and os.path.isfile(val):
+            return val
+
+    return None
+
+
+def _find_app_from_reg(name):
+    for child in _reg_entries():
+        exe = _exe_from_reg_entry(child, name)
+        if exe:
+            return exe
+    return None
+
 def find_workbuddy_runtime():
     override = os.environ.get("WORKBUDDY_EXE")
     if override:
@@ -332,6 +392,9 @@ def find_workbuddy_runtime():
         for name in ("ProgramFiles", "ProgramFiles(x86)"):
             if os.environ.get(name):
                 candidates.append(os.path.join(os.environ[name], "WorkBuddy", "WorkBuddy.exe"))
+        p = _find_app_from_reg("WorkBuddy")
+        if p:
+            candidates.append(p)
     elif sys.platform == "darwin":
         candidates = [_mac_runtime(os.path.join(root, "WorkBuddy.app"))
                       for root in ("/Applications", os.path.join(home, "Applications"))]
