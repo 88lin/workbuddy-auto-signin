@@ -50,7 +50,7 @@ import urllib.request
 import urllib.parse
 import uuid
 from contextlib import closing
-from datetime import datetime
+from datetime import date, datetime
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
 AUTH_BASENAME = os.path.join("CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info")
@@ -74,8 +74,7 @@ MAX_BUDGET_SECONDS = 540.0          # 签到任务 PT10M = 600s - 60s
 # 冷启动重试跑得完；但仍远小于 PT5M，跑不完就早收尾、四小时后再来。
 POLL_BUDGET_SECONDS = 180.0
 POLL_MAX_BUDGET_SECONDS = 240.0     # 轮询任务 PT5M = 300s - 60s
-# 每轮最多用掉几张补登卡。卡是稀缺资源（上限 4 张），而这条写路径还没被真实响应
-# 验证过，一轮只花一张：猜错形状也只错一次，一天 6 轮照样能把断登补完。
+# 每轮最多用掉一张补登卡；仅依据服务端活跃日历中明确的当月断登日期操作。
 MAKEUP_MAX_PER_RUN = 1
 REQUEST_TIMEOUT = 30
 # 网络类失败的退避节奏（秒）。定时任务最容易撞上的就是"刚开机/刚唤醒"：WiFi 重连、
@@ -836,6 +835,57 @@ def dig(obj, key):
     return None
 
 
+def _api_success(code, body):
+    """补登相关接口同时检查 HTTP 状态和 JSON 业务码。"""
+    business_code = body.get("code") if isinstance(body, dict) else None
+    return 200 <= code < 300 and (
+        business_code is None or (type(business_code) is int and business_code == 0))
+
+
+def _makeup_candidates(streak_body, heatmap_body):
+    """从日历选断登日期；makeup_dates 是已补登历史，不能作为待办清单。
+
+    对齐官方成长中心：当月、今天之前、活动上线之后、score == 0。
+    使用 heatmap.today 的服务端日期，避免本机时区把月初/午夜算错。
+    日历缺项不推测为零；结构异常时整段停止，不能靠猜测消耗补登卡。
+    """
+    def parse_date(value):
+        if not isinstance(value, str) or re.fullmatch(r"\d{4}-\d{2}-\d{2}", value) is None:
+            raise ValueError("补登日期格式无效")
+        return date.fromisoformat(value)
+
+    today_obj = dig(heatmap_body, "today")
+    if not isinstance(today_obj, dict):
+        raise ValueError("活跃日历缺少服务端日期")
+    today = parse_date(today_obj.get("date"))
+    launch = parse_date(dig(streak_body, "launch_date"))
+    start = max(today.replace(day=1), launch, date(2026, 6, 17))
+    streak = dig(streak_body, "streak")
+    if not isinstance(streak, dict):
+        raise ValueError("连登状态格式无效")
+    made_up = streak.get("makeup_dates", [])
+    if not isinstance(made_up, list):
+        raise ValueError("已补登记录格式无效")
+    made_up = {parse_date(value) for value in made_up}
+    cells = dig(heatmap_body, "cells")
+    if not isinstance(cells, list):
+        raise ValueError("活跃日历缺少日期列表")
+    scores = {}
+    for cell in cells:
+        if not isinstance(cell, dict):
+            raise ValueError("活跃日历记录格式无效")
+        day = parse_date(cell.get("date"))
+        score = cell.get("score")
+        if type(score) not in (int, float) or not math.isfinite(score) or score < 0:
+            raise ValueError("活跃日历分数无效")
+        if day in scores and scores[day] != score:
+            raise ValueError("活跃日历同一日期的记录冲突")
+        scores[day] = score
+    # 最近的断点优先，以便尽早恢复当前连登；每轮仍受 MAKEUP_MAX_PER_RUN 限制。
+    return sorted((day.isoformat() for day, score in scores.items()
+                   if start <= day < today and score == 0 and day not in made_up), reverse=True)
+
+
 def fmt_credit(v):
     """积分显示用：能转 int 就转，否则原样返回（OverflowError 同理，见 as_int）。"""
     try:
@@ -1054,18 +1104,18 @@ def run_growth(headers, endpoint):
         """已知业务 403 由调用方先处理，其余认证/权限拒绝结束本轮。"""
         return code in (401, 403)
 
-    def _note_http(code, body, label):
+    def _note_http(code, body, label, required=False):
         """前置查询接口非 2xx 时的统一记录；返回 True 表示调用方应跳过后续处理。
 
         硬失败（5xx / 网络不可达 / 预算耗尽）必须计入 failures：否则整轮
         successes=0 且 failures=0 会被判成 idle，轮询既不写日志又返回 0，
         服务端故障彻底无声无息。旅行模块早就这么做了，其余各段没跟上。
 
-        4xx 只进报告、不计失败：绝大多数是业务规则（活动未开始、接口下线），
-        计入会让轮询天天强制落盘。手动跑 `growth` 仍能在报告里看到它。
+        一般查询的 4xx 只进报告、不计失败。补登判断所必需的查询用 required=True：
+        查询失败或业务码非零时必须提醒，不能把未知状态解释为无需补登。
         """
         nonlocal failures, hard_failures
-        if 200 <= code < 300:
+        if 200 <= code < 300 and (not required or _api_success(code, body)):
             return False
         reason = _http_label(code)
         detail = ""
@@ -1075,7 +1125,7 @@ def run_growth(headers, endpoint):
         # 又看不出是网络还是服务端，轮询日志里这两者都想要
         parts.append("%s失败：%s" % (label, "%s（%s）" % (reason, detail)
                                      if detail and detail != reason else (detail or reason)))
-        if _is_hard_failure(code):
+        if required or _is_hard_failure(code):
             failures += 1
             hard_failures += 1
         return True
@@ -1236,11 +1286,11 @@ def run_growth(headers, endpoint):
             hard_failures += 1
 
     # --- 3. 补登卡：断登自动补一张，保住连登 ---
-    # 官方规则：补登卡上限 4 张、仅可补救当月断登；/streak 的 makeup_dates
-    # 是服务端算好的可补日期。卡攒着不花，超上限后新卡也拿不到，断登优先补。
+    # 官方规则：补登卡上限 4 张、仅可补救当月断登。/streak 的 makeup_dates
+    # 是已经补登的日期；真正的断点来自 /heatmap 中 score == 0 的历史日期。
     # 放在连登兑换之前：补登会改变连登天数，先补，兑换才能拿到最新解锁状态。
-    # 注意：实测时 makeup_dates 一直是 []，这条写路径没有被真实响应验证过，
-    # 所以每轮最多补一张（见 MAKEUP_MAX_PER_RUN），万一形状猜错也只错一次。
+    # 2026-10-01 核对官方 GrowthCenterPage / AllTasksPage 与真实只读日历。
+    # 保留每轮最多一张、写请求不重试的限制；空白或异常数据不会触发补登。
     streak_body = None    # 复用给第 7 段的展示值，避免同一轮打两次 /streak
     streak_stale = False  # 补登成功会改变连签天数，此时必须重新取
     if _budget_left() <= 0:
@@ -1250,44 +1300,54 @@ def run_growth(headers, endpoint):
             mcode, mbody = get(base + "/streak", headers)
             if _check_auth(mcode):
                 return 1, _auth_failure(mcode)
-            if not _note_http(mcode, mbody, "查连登状态"):
+            if not _note_http(mcode, mbody, "查连登状态", required=True):
                 streak_body = mbody
                 # 余额兼容两种形状：{"makeup_cards":{"balance":2}} 与 {"makeup_cards":2}。
                 # 只认前者的话，接口是后者时整个补登会一声不响地永不执行。
                 cards_obj = dig(mbody, "makeup_cards")
                 cards = as_int(cards_obj.get("balance")) if isinstance(cards_obj, dict) \
                     else as_int(cards_obj)
-                # 实测 makeup_dates 在 streak 对象内部（不在顶层），当前值为 []；
-                # dig 只做顶层查找，这里手动下钻，两处都兜住以防接口调整。
-                streak_obj = dig(mbody, "streak") or {}
-                dates = (streak_obj.get("makeup_dates") if isinstance(streak_obj, dict) else None) \
-                    or dig(mbody, "makeup_dates") or []
-                if cards > 0 and isinstance(dates, list) and dates:
+                dates = []
+                if cards > 0:
+                    hcode, hbody = get(base + "/heatmap", headers)
+                    if _check_auth(hcode):
+                        return 1, _auth_failure(hcode)
+                    if not _note_http(hcode, hbody, "查补登日历", required=True):
+                        dates = _makeup_candidates(mbody, hbody)
+                if dates:
+                    made_up = 0
                     for d in dates[:min(cards, MAKEUP_MAX_PER_RUN)]:
                         if _budget_left() <= 0:
                             parts.append("时间预算耗尽，剩余补登下次再做")
                             break
                         ucode, ubody = post(base + "/makeup-cards/use", headers,
-                                            {"target_date": d, "client_token": _client_token()})
+                                            {"target_date": d})
                         if _check_auth(ucode):
                             return 1, _auth_failure(ucode)
-                        if 200 <= ucode < 300:
+                        if _api_success(ucode, ubody):
                             cards -= 1
+                            made_up += 1
                             streak_stale = True
                             # 优先报服务端给的余额，本地递减只是接口没给时的兜底
                             left_obj = dig(ubody, "makeup_cards")
                             left_cards = as_int(left_obj.get("balance"), cards) \
                                 if isinstance(left_obj, dict) else as_int(left_obj, cards)
                             parts.append("补登 %s（剩 %s 张卡）" % (d, left_cards))
+                            cards = max(0, left_cards)
                             successes += 1
                         else:
                             msg = dig(ubody, "msg") or ""
+                            if ucode == 400 and str(msg).strip().lower() == "date is not broken, no makeup needed":
+                                # 查询后被客户端或另一轮补上，是正常竞争；不再当作失败刷日志。
+                                parts.append("%s 已活跃或已补登，无需再次补登" % d)
+                                break
                             parts.append("补登 %s 失败：%s" % (d, msg or "HTTP %s" % ucode))
                             failures += 1
-                            hard_failures += _is_hard_failure(ucode)
-                    if len(dates) > MAKEUP_MAX_PER_RUN and cards > 0:
+                            hard_failures += 1
+                            break
+                    if made_up and len(dates) > made_up and cards > 0:
                         parts.append("另有 %s 天可补、剩 %s 张卡，下轮继续" % (
-                            len(dates) - MAKEUP_MAX_PER_RUN, cards))
+                            len(dates) - made_up, cards))
         except Exception as e:
             parts.append("补登模块异常（%s: %s）" % (type(e).__name__, e))
             failures += 1
@@ -1469,9 +1529,9 @@ def run_growth(headers, endpoint):
     if tail:
         report += "（%s）" % "，".join(tail)
 
-    # 只有"确有需要关注的失败且一件都没成"才算整体失败。
-    # 派 Buddy 已达每日上限这类 4xx 是每天的常态，不能让计划任务天天报红。
-    result_code = 1 if (hard_failures and not successes) else 0
+    # 已获得的奖励仍保留在汇报里，但不能掩盖其他步骤需要处理的失败。
+    # 已识别的正常业务状态（如旅行名额用完、日期无需补登）不会计入 hard_failures。
+    result_code = 1 if hard_failures else 0
     # idle = 这一轮既没领到东西也没出错，纯空跑（Buddy 还在路上 / 今日名额已用完 /
     # 确实没有可领项）。轮询任务靠它决定要不要写日志。
     idle = (successes == 0 and failures == 0)
@@ -1608,10 +1668,9 @@ def run_daily(headers, endpoint):
                           "report": "成长中心异常（%s: %s）" % (type(e).__name__, e)}
     out["growth"] = gout.get("report")
     out["growth_result"] = gout.get("result")
-    if gout.get("credits_gained"):
+    if gout.get("credits_gained") or gcode != 0:
         out["report"] += "；" + gout["report"]
-    # run_growth 只在"确有硬失败且一件都没成"时返回非 0（无可领取项、4xx 业务规则
-    # 均返回 0），直接透传即可——之前按 result 枚举漏了 result=GROWTH 的整体失败
+    # 成长中心有需要处理的失败即返回非零；保留签到成功结果，同时透传提醒。
     if gcode != 0 and code == 0:
         code = gcode
     out["needs_attention"] = code != 0
