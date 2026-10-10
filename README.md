@@ -150,6 +150,60 @@ cd workbuddy-auto-signin
 
 ---
 
+#### 📱 云端沙箱 / 手机 App：一键配置
+
+**没有桌面端的环境看这里**——Linux 云沙箱、WorkBuddy 手机 App / 小程序背后那台机器。
+这类环境**登录凭据不会自动落地**，脚本会报 `NO_AUTH`。
+
+不用研究原理，**把下面这一整段复制、粘贴发给 WorkBuddy**，剩下的它全帮你做完：
+
+```text
+帮我在这个环境里配置 WorkBuddy 每日自动签到（每天 00:05 自动领积分）。按下面做：
+
+0. 先自检：执行 which codebuddy; python3 --version; git --version
+   三个都得有。缺 codebuddy 就直接告诉我，别往下做。
+
+1. 取脚本：
+   git clone https://gh-proxy.com/https://github.com/88lin/workbuddy-auto-signin.git /workspace/workbuddy-auto-signin
+
+2. 拿登录凭据（关键，别跳步）：
+   这台机器的登录态是平台注入的，CLI 不会写凭据文件，所以脚本会报 NO_AUTH。必须让 CLI 走授权流程：
+   - 用 Python 的 pty 模块在伪终端里启动 codebuddy（不能用 -p 模式，那样 /login 不生效）
+   - 启动前 unset：ACC_PRODUCT_CONFIG_V2、ACC_PRODUCT_CONFIG_V3、X_IDE_AUTH_PROXY、IDE_EDITOR_SERVER_AUTH_TYPE
+   - 伪终端窗口设成 250 列，否则登录链接会被折行截断，拿到的是半截
+   - 按键一律用 \r（不是 \n），时间线：约 8 秒后 \r（确认信任目录）→ 14 秒后 /login\r → 22 秒后 \r（选「中国站」）
+   - 从输出里正则提取完整的 https://copilot.tencent.com/login?... 链接发给我
+   - 进程保持运行等我授权，轮询 ~/.local/share/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info 是否生成
+   拿到登录链接后停下来等我，不要自己空转重试。
+
+3. 我登录完你再继续：
+   python3 /workspace/workbuddy-auto-signin/signin.py doctor
+   python3 /workspace/workbuddy-auto-signin/signin.py auto
+   doctor 里 credential_format 必须是 plaintext；auto 实跑一次确认积分到账。
+
+4. 建定时任务（建两条）：
+   这台机器没有 crontab、systemd 也起不来，只能用 WorkBuddy 的自动化功能，不要尝试系统定时任务。
+   - 第一条「每日自动领 WorkBuddy 积分」：每天执行，Cron 0 5 0 * * *（每天 00:05），时区 Asia/Shanghai
+   - 第二条「WorkBuddy 签到轮询兜底」：按间隔执行，Cron 0 0 */4 * * *（每 4 小时）
+   两条的执行指令都用：运行 python3 /workspace/workbuddy-auto-signin/signin.py auto，把命令输出的 JSON 里 report 字段的内容，直接一句话汇报给我。若 JSON 的 needs_attention 为 true 或命令退出码非 0，额外提醒我处理。
+   第二条也用 auto、不要用 silent-poll：它会先看签到状态、没签才补，能兜住 00:05 那次没跑成的情况；已签过只是一次查询，不会重复领取。
+```
+
+> [!IMPORTANT]
+> 跑到第 2 步**它会停下来发你一个登录链接**，这时候你需要自己动一次手：
+> 把链接**发到微信聊天框，再从微信里点开**登录。
+> 用系统浏览器打开会被劫持跳到小程序、授权走不完（实测：微信点开 2 分 38 秒成功，
+> 浏览器打开失败）。登录完它会自动接着跑。
+
+> [!TIP]
+> 全部跑完后，去 App / 小程序的自动化任务列表，点进那两条任务 **编辑 → 选模型 hy3（免费）**。
+> 创建任务的接口没有模型参数，模型只能在界面上选。
+
+`gh-proxy.com` 是国内镜像，GitHub 访问慢的时候用；能直连就把前缀去掉。
+想了解原理和排错，看 [docs/linux-cloud-signin.md](docs/linux-cloud-signin.md)。
+
+---
+
 ### 模式 B：系统级静默（推荐）
 
 用系统自带的定时器直接运行脚本，**完全不经过 AI 模型**。Windows 走任务计划程序 + `pythonw.exe`（无窗口 Python），macOS 走 launchd，两边都是零 Token、无窗口。
