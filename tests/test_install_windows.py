@@ -112,8 +112,8 @@ exit $LASTEXITCODE
 
 @unittest.skipUnless(SHELLS, "Windows PowerShell is required for installer tests")
 class WindowsInstallerTests(unittest.TestCase):
-    def run_installer(self, shell, scenario):
-        with tempfile.TemporaryDirectory(prefix="workbuddy installer 空格 ") as temp:
+    def run_installer(self, shell, scenario, prefix="workbuddy installer 空格 ", neutral_cwd=False):
+        with tempfile.TemporaryDirectory(prefix=prefix) as temp:
             root = Path(temp)
             installer = root / "install-windows.ps1"
             shutil.copyfile(ROOT / "install-windows.ps1", installer)
@@ -122,11 +122,15 @@ class WindowsInstallerTests(unittest.TestCase):
             harness = root / "harness.ps1"
             harness.write_text(HARNESS, encoding="utf-8-sig")
             trace = root / "trace.jsonl"
+            cwd = None
+            if neutral_cwd:
+                cwd = root / "cwd"
+                cwd.mkdir()
             result = subprocess.run(
                 [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                  "-File", str(harness), "-Installer", str(installer),
                  "-TracePath", str(trace), "-Scenario", scenario],
-                capture_output=True, encoding="utf-8", errors="replace", timeout=30)
+                cwd=cwd, capture_output=True, encoding="utf-8", errors="replace", timeout=30)
             events = [json.loads(line) for line in trace.read_text(encoding="utf-8-sig").splitlines()] \
                 if trace.exists() else []
             return result, events
@@ -161,6 +165,27 @@ class WindowsInstallerTests(unittest.TestCase):
                 self.assertEqual([t["At"] for t in events[1]["value"]["triggers"]],
                                  ["01:00", "05:00", "09:00", "13:00", "17:00", "21:00"])
                 self.assertTrue(all(e["value"] == "\\" for e in events[2:]))
+
+    def test_bracketed_install_directory_resolves_literal_paths(self):
+        # A neutral cwd is required: when $PSScriptRoot lookup breaks, the installer
+        # falls back to Get-Location, where the repo's real signin.py would mask it.
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                result, events = self.run_installer(
+                    shell, "success",
+                    prefix="workbuddy installer [brackets] ",
+                    neutral_cwd=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("两个定时任务已就位", result.stdout)
+                self.assertEqual([(e["kind"], e["name"]) for e in events],
+                                 [("register", DAILY), ("register", POLL),
+                                  ("get", DAILY), ("info", DAILY),
+                                  ("get", POLL), ("info", POLL)])
+                for event, mode in zip(events[:2], ("silent", "silent-poll")):
+                    action = event["value"]["action"]
+                    self.assertIn("[brackets]", action["Execute"])
+                    self.assertIn("[brackets]", action["Arguments"])
+                    self.assertTrue(action["Arguments"].endswith('signin.py" ' + mode))
 
     def test_registration_error_stops_even_when_old_tasks_can_be_read(self):
         # The mock reads return Ready even after registration fails: existing tasks
