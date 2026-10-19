@@ -227,6 +227,27 @@ class AuthTests(unittest.TestCase):
                 else:
                     self.assertIn("WorkBuddy", signin.find_workbuddy_runtime())
 
+    def test_registry_value_parsing(self):
+        for raw, expected in (
+            (r"E:\WorkBuddy\WorkBuddy.exe", r"E:\WorkBuddy\WorkBuddy.exe"),
+            ('"E:\\WorkBuddy\\Uninstall WorkBuddy.exe" /allusers', r"E:\WorkBuddy\WorkBuddy.exe"),
+            (r"E:\WorkBuddy\WorkBuddy.exe,0", r"E:\WorkBuddy\WorkBuddy.exe"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(signin._registry_exe(raw), expected)
+        for raw in ("", None, r"E:\WorkBuddy\readme.txt", '"'):
+            with self.subTest(raw=raw):
+                self.assertIsNone(signin._registry_exe(raw))
+
+    def test_custom_install_dir_found_via_registry(self):
+        # 装到非默认盘的机器：默认目录全落空，只能靠卸载注册表项定位
+        exe = r"D:\WorkBuddy\WorkBuddy.exe"
+        with patch.dict(os.environ, {"WORKBUDDY_EXE": ""}), \
+                patch.object(sys, "platform", "win32"), \
+                patch.object(signin, "_win_registry_runtimes", return_value=[exe]), \
+                patch("os.path.isfile", side_effect=lambda path: path == exe):
+            self.assertEqual(signin.find_workbuddy_runtime(), os.path.abspath(exe))
+
     def test_linux_cli_auth_path(self):
         with patch.dict(os.environ, {"WORKBUDDY_AUTH_FILE": "", "XDG_DATA_HOME": self.temp.name}):
             expected = os.path.join(self.temp.name, signin.CLI_AUTH_BASENAME)

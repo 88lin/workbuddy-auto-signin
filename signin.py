@@ -317,6 +317,79 @@ def _mac_runtime(bundle):
         return None
 
 
+def _registry_exe(value):
+    """从 InstallLocation / DisplayIcon / UninstallString 里还原安装目录下的 WorkBuddy.exe。
+
+    取值形态：`E:\\WorkBuddy\\WorkBuddy.exe`、`"E:\\WorkBuddy\\Uninstall WorkBuddy.exe" /allusers`、
+    `E:\\WorkBuddy\\WorkBuddy.exe,0`。只负责解析，是否存在由调用方判断。
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.startswith('"'):
+        end = text.find('"', 1)
+        if end <= 1:
+            return None
+        text = text[1:end]
+    else:
+        # 无引号时先砍掉图标序号（,0），再截到 .exe 为止，避免把命令行参数当成路径
+        text = text.split(",")[0].strip()
+        match = re.search(r"(?i)\.exe\b", text)
+        if not match:
+            return None
+        text = text[:match.end()]
+    if not text.lower().endswith(".exe"):
+        return None
+    return os.path.join(os.path.dirname(text), "WorkBuddy.exe")
+
+
+def _win_registry_runtimes():
+    """自定义安装目录（如 D:\\WorkBuddy）的兜底发现路径：读卸载注册表项。
+
+    安装器允许改安装盘，默认目录探测就必然落空。这里只读注册表，任何异常都当作
+    “没有候选”处理——注册表不可读不该盖过真正的结论，也不该拖慢正常路径。
+    """
+    if os.name != "nt" or sys.platform != "win32":
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+    uninstall = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+    found = []
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                key = winreg.OpenKey(root, uninstall, 0, winreg.KEY_READ | view)
+            except OSError:
+                continue
+            try:
+                for index in range(winreg.QueryInfoKey(key)[0]):
+                    try:
+                        with winreg.OpenKey(key, winreg.EnumKey(key, index)) as sub:
+                            try:
+                                display = winreg.QueryValueEx(sub, "DisplayName")[0]
+                            except OSError:
+                                continue
+                            if not isinstance(display, str) or "workbuddy" not in display.lower():
+                                continue
+                            for field in ("InstallLocation", "DisplayIcon", "UninstallString"):
+                                try:
+                                    path = _registry_exe(winreg.QueryValueEx(sub, field)[0])
+                                except OSError:
+                                    continue
+                                if path:
+                                    found.append(path)
+                    except OSError:
+                        continue
+            finally:
+                try:
+                    key.Close()
+                except OSError:
+                    pass
+    return found
+
+
 def find_workbuddy_runtime():
     override = os.environ.get("WORKBUDDY_EXE")
     if override:
@@ -335,6 +408,9 @@ def find_workbuddy_runtime():
     elif sys.platform == "darwin":
         candidates = [_mac_runtime(os.path.join(root, "WorkBuddy.app"))
                       for root in ("/Applications", os.path.join(home, "Applications"))]
+    if sys.platform == "win32":
+        # 默认目录没命中时再查注册表：安装器允许改到别的盘，这类机器只能靠卸载记录定位
+        candidates += _win_registry_runtimes()
     for path in candidates:
         if path and os.path.isfile(path) and (os.name == "nt" or os.access(path, os.X_OK)):
             return os.path.abspath(path)
