@@ -1,10 +1,10 @@
 <div align="center">
 
-<img src="assets/cover.jpg" alt="workbuddy-auto-signin —— WorkBuddy 自动签到脚本" width="100%">
+<img src="assets/cover.jpg" alt="workbuddy-auto-signin —— WorkBuddy / Qoder CN 自动领取脚本" width="100%">
 
 # 🤖 workbuddy-auto-signin
 
-**自动领取 WorkBuddy 每日签到积分的小脚本**
+**每天自动领取 WorkBuddy 签到积分 + Qoder CN 每日 100 Credits 的小脚本**
 
 [![版本](https://img.shields.io/github/v/release/88lin/workbuddy-auto-signin?style=flat&logo=github&logoColor=white&label=%E7%89%88%E6%9C%AC&color=1F6FEB)](https://github.com/88lin/workbuddy-auto-signin/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-8B5CF6?style=flat&logo=opensourceinitiative&logoColor=white)](LICENSE)
@@ -14,7 +14,9 @@
 
 </div>
 
-> 一个自包含的 Python 脚本，每天自动帮你领取 **WorkBuddy**（腾讯 AI 编程助手）的每日签到积分。只读取你自己机器上的登录态，零内置密钥，可安全分享。
+> 两个自包含的 Python 脚本，每天分别帮你领取 **WorkBuddy**（腾讯 AI 编程助手）的签到积分和 **Qoder CN** 的 100 通用 Credits。两者都只读取你自己机器上的登录态，零内置密钥，可安全分享。
+>
+> Qoder CN 是可选的独立功能，Windows 下可一键安装独立计划任务，不影响 WorkBuddy；详见[可选：Qoder CN](#qoder-cn)。
 >
 > 👤 作者：[88lin](https://dev.88lin.eu.org/) · 📦 仓库：[github.com/88lin/workbuddy-auto-signin](https://github.com/88lin/workbuddy-auto-signin)
 
@@ -46,9 +48,9 @@
 </tr>
 <tr>
 <td width="180" align="center" valign="middle">
-  <a href="https://www.workbuddy.cn/events/invite?inviteCode=w0x2ic45z"><img src="https://raw.githubusercontent.com/88lin/picx-images-hosting/master/workbuddy-logo.png" alt="WorkBuddy" width="150"></a>
+  <a href="https://www.workbuddy.cn/events/invite?inviteCode=1qbwl6bilsn"><img src="https://raw.githubusercontent.com/88lin/picx-images-hosting/master/workbuddy-logo.png" alt="WorkBuddy" width="150"></a>
 </td>
-<td valign="middle"><b><a href="https://www.workbuddy.cn/events/invite?inviteCode=w0x2ic45z">WorkBuddy</a></b>&nbsp;是腾讯出品的全能 AI 工作台，是中国最受欢迎的效率 AI 智能体服务，说出要求、开始执行任务、交付完整成果。其中Hy4模型限时免费使用，注册即可获取2000积分，每月再赠送500积分，可用Kimi-K3、GLM-5.3、Deepseek-V4.1-Flash等模型。</td>
+<td valign="middle"><b><a href="https://www.workbuddy.cn/events/invite?inviteCode=1qbwl6bilsn">WorkBuddy</a></b>&nbsp;是腾讯出品的全能 AI 工作台，是中国最受欢迎的效率 AI 智能体服务，说出要求、开始执行任务、交付完整成果。其中Hy4模型限时免费使用，注册即可获取2000积分，每月再赠送500积分，可用Kimi-K3、GLM-5.3、Deepseek-V4.1-Flash等模型。</td>
 </tr>
 <tr>
 <td width="180" align="center" valign="middle">
