@@ -113,8 +113,8 @@ def expected_times():
 
 @unittest.skipUnless(SHELLS, "Windows PowerShell is required for installer tests")
 class QoderWindowsInstallerTests(unittest.TestCase):
-    def run_installer(self, shell, scenario):
-        with tempfile.TemporaryDirectory(prefix="qoder installer 空格 ") as temp:
+    def run_installer(self, shell, scenario, prefix="qoder installer 空格 ", neutral_cwd=False):
+        with tempfile.TemporaryDirectory(prefix=prefix) as temp:
             root = Path(temp)
             installer = root / "install-qoder-windows.ps1"
             shutil.copyfile(ROOT / "install-qoder-windows.ps1", installer)
@@ -123,11 +123,15 @@ class QoderWindowsInstallerTests(unittest.TestCase):
             harness = root / "harness.ps1"
             harness.write_text(HARNESS, encoding="utf-8-sig")
             trace = root / "trace.jsonl"
+            cwd = None
+            if neutral_cwd:
+                cwd = root / "cwd"
+                cwd.mkdir()
             result = subprocess.run(
                 [shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                  "-File", str(harness), "-Installer", str(installer),
                  "-TracePath", str(trace), "-Scenario", scenario],
-                capture_output=True, encoding="utf-8", errors="replace", timeout=30)
+                cwd=cwd, capture_output=True, encoding="utf-8", errors="replace", timeout=30)
             events = [json.loads(line) for line in
                       trace.read_text(encoding="utf-8-sig").splitlines()] \
                 if trace.exists() else []
@@ -159,6 +163,24 @@ class QoderWindowsInstallerTests(unittest.TestCase):
                                  '^".*qoder_signin[.]py" silent$')
                 self.assertEqual([t["At"] for t in value["triggers"]], expected_times())
                 self.assertTrue(all(e["value"] == "\\" for e in events[1:]))
+
+    def test_bracketed_install_directory_resolves_literal_paths(self):
+        # A neutral cwd is required: when $PSScriptRoot lookup breaks, the installer
+        # falls back to Get-Location, where the repo's real qoder_signin.py would mask it.
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                result, events = self.run_installer(
+                    shell, "success",
+                    prefix="qoder installer [brackets] ",
+                    neutral_cwd=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("定时任务已就位", result.stdout)
+                self.assertEqual([(e["kind"], e["name"]) for e in events],
+                                 [("register", TASK), ("get", TASK), ("info", TASK)])
+                action = events[0]["value"]["action"]
+                self.assertIn("[brackets]", action["Execute"])
+                self.assertIn("[brackets]", action["Arguments"])
+                self.assertTrue(action["Arguments"].endswith('qoder_signin.py" silent'))
 
     def test_definition_failure_stops_before_registration(self):
         for shell in SHELLS:

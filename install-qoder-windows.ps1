@@ -25,13 +25,13 @@ $ManualSignin  = ""   # 例如 C:\Users\You\Desktop\checkin\qoder_signin.py
 function Find-Pythonw {
     # 1) PATH 里就有 pythonw
     $c = (Get-Command pythonw -ErrorAction SilentlyContinue).Source
-    if ($c -and (Test-Path $c)) { return $c }
+    if ($c -and (Test-Path -LiteralPath $c)) { return $c }
 
     # 2) PATH 里有 python.exe，取同目录的 pythonw
     $py = (Get-Command python -ErrorAction SilentlyContinue).Source
     if ($py) {
         $c = Join-Path (Split-Path $py) "pythonw.exe"
-        if (Test-Path $c) { return $c }
+        if (Test-Path -LiteralPath $c) { return $c }
     }
 
     # 3) 常见安装目录（很多 Windows 装机 Python 并不进 PATH，这一步最常命中）
@@ -47,12 +47,12 @@ function Find-Pythonw {
 
     # 4) py 启动器（装在 C:\Windows，几乎总在）
     $launcher = Join-Path $env:SystemRoot "py.exe"
-    if (Test-Path $launcher) {
+    if (Test-Path -LiteralPath $launcher) {
         try {
             $exe = (& $launcher -3 -c "import sys;print(sys.executable)" 2>$null | Select-Object -Last 1)
             if ($exe) {
                 $c = Join-Path (Split-Path $exe.Trim()) "pythonw.exe"
-                if (Test-Path $c) { return $c }
+                if (Test-Path -LiteralPath $c) { return $c }
             }
         } catch { }
     }
@@ -68,8 +68,8 @@ Write-Host "[1/3] 定位 pythonw.exe ..." -NoNewline
 $pythonw = $ManualPythonw
 # 必须先判空再 Test-Path：Test-Path "" 在 PowerShell 5.1 抛参数校验异常，
 # 配合顶部的 $ErrorActionPreference = "Stop" 会让脚本直接死在这一行。
-if (-not $pythonw -or -not (Test-Path $pythonw)) { $pythonw = Find-Pythonw }
-if (-not $pythonw -or -not (Test-Path $pythonw)) {
+if (-not $pythonw -or -not (Test-Path -LiteralPath $pythonw)) { $pythonw = Find-Pythonw }
+if (-not $pythonw -or -not (Test-Path -LiteralPath $pythonw)) {
     Write-Host " 失败" -ForegroundColor Red
     Write-Host ""
     Write-Host "没找到 pythonw.exe。请先安装 Python 3：https://www.python.org/downloads/" -ForegroundColor Yellow
@@ -83,18 +83,18 @@ Write-Host "[2/3] 定位 qoder_signin.py ..." -NoNewline
 $signin = $ManualSignin
 # 同上：$ManualSignin 默认为空串，不判空会崩在 Test-Path 的参数校验上。
 # $PSScriptRoot 在脚本被直接粘进控制台执行时也是空的，Join-Path 同样不接受空 Path。
-if (-not $signin -or -not (Test-Path $signin)) {
+if (-not $signin -or -not (Test-Path -LiteralPath $signin)) {
     if ($PSScriptRoot) { $signin = Join-Path $PSScriptRoot "qoder_signin.py" }
 }
-if (-not $signin -or -not (Test-Path $signin)) { $signin = Join-Path (Get-Location) "qoder_signin.py" }
-if (-not $signin -or -not (Test-Path $signin)) {
+if (-not $signin -or -not (Test-Path -LiteralPath $signin)) { $signin = Join-Path (Get-Location) "qoder_signin.py" }
+if (-not $signin -or -not (Test-Path -LiteralPath $signin)) {
     Write-Host " 失败" -ForegroundColor Red
     Write-Host ""
     Write-Host "没找到 qoder_signin.py。请把本脚本和 qoder_signin.py 放在同一目录后重跑，" -ForegroundColor Yellow
     Write-Host "或把脚本顶部的 `$ManualSignin 填成完整路径。" -ForegroundColor Yellow
     exit 1
 }
-$signin = (Resolve-Path $signin).Path
+$signin = (Resolve-Path -LiteralPath $signin).Path
 Write-Host " $signin" -ForegroundColor Green
 
 # --- 3. 创建定时任务 ---
@@ -162,7 +162,7 @@ Write-Host "  $taskName  $state" -ForegroundColor Green
 Write-Host "  每天 $($times -join '、')  领取 Qoder CN 100 Credits（静默）"
 Write-Host "  下次运行 $nextRun" -ForegroundColor DarkGray
 Write-Host ""
-$logFile = Join-Path (Split-Path $signin) "qoder_signin.log"
+$logFile = Join-Path (Split-Path -LiteralPath $signin) "qoder_signin.log"
 Write-Host "日志：$logFile" -ForegroundColor Cyan
 Write-Host "任务只在真领到、活动异常或出错时写日志；平常「已领过」不落盘。" -ForegroundColor DarkGray
 Write-Host ""
