@@ -113,7 +113,12 @@ $operation = "创建"
 try {
     # 模块命令可能使用自己的错误偏好；必须在调用处显式指定 Stop。
     # 即使安装时需要提权，定时运行仍使用当前账号的普通权限。
-    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive `
+    # 本机实测：裸用户名（如 "DANNYSL"）注册主体会被任务计划服务以“参数错误”拒绝，
+    # 必须带上域/计算机名前缀的完整形式（"DANNYSL\DANNYSL"）才能注册成功。
+    $userId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    if (-not $userId) { $userId = "$env:USERDOMAIN\$env:USERNAME" }
+    if (-not $userId) { $userId = $env:USERNAME }
+    $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive `
         -RunLevel Limited -ErrorAction Stop
 
     $triggers = @()
