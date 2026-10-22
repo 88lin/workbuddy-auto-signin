@@ -232,7 +232,11 @@ def load_session():
     dirs = find_auth_dirs()
     looked_in = [str(d) for d in dirs]
     if not dirs:
-        raise NoAuthError("没找到 %APPDATA%\\%s，请先安装并登录 Qoder CN 桌面端"
+        # 注意：消息里的 %APPDATA% 必须写成 %%APPDATA%%——这行只在没找到
+        # 登录态目录时执行，% 格式化运算符会把单个 %A 当格式字符直接抛
+        # ValueError，把干净的 NO_AUTH 变成“脚本运行异常”。装了桌面端的
+        # 机器走不到这行，所以这个 bug 在正常环境不会暴露。
+        raise NoAuthError("没找到 %%APPDATA%%\\%s，请先安装并登录 Qoder CN 桌面端"
                           % AUTH_DIR_GLOB, looked_in)
 
     errors = []
