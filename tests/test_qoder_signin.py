@@ -2,6 +2,7 @@ import json
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 import qoder_signin as qoder
 
@@ -83,6 +84,18 @@ class FormattingTests(unittest.TestCase):
         self.assertTrue(qoder._token_expired({"expiresAt": past}))
         self.assertFalse(qoder._token_expired({}))
         self.assertIsNone(qoder._parse_iso("not-a-date"))
+
+
+class AuthDiscoveryTests(unittest.TestCase):
+    def test_missing_auth_dirs_raises_no_auth_not_format_error(self):
+        # 消息里的字面 %APPDATA% 若不转义，% 格式化会先抛 ValueError，
+        # 用户看到的就不是 NO_AUTH 而是“脚本运行异常”。
+        with mock.patch.object(qoder, "IS_WINDOWS", True), \
+             mock.patch.object(qoder, "find_auth_dirs", return_value=[]):
+            with self.assertRaises(qoder.NoAuthError) as ctx:
+                qoder.load_session()
+        self.assertIn("%APPDATA%", str(ctx.exception))
+        self.assertEqual(ctx.exception.looked_in, [])
 
 
 class ClaimTests(unittest.TestCase):
