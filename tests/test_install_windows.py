@@ -20,6 +20,16 @@ SHELLS = [path for name in ("powershell.exe", "pwsh.exe")
 DAILY = "WorkBuddyAutoSignin"
 POLL = "WorkBuddyGrowthPoll"
 
+
+def current_user_identity(shell):
+    script = ("[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);"
+              "[System.Security.Principal.WindowsIdentity]::GetCurrent().Name")
+    result = subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, encoding="utf-8", errors="replace", timeout=30)
+    return result.stdout.strip()
+
+
 HARNESS = r'''
 param($Installer, $TracePath, $Scenario)
 $ErrorActionPreference = 'Stop'
@@ -144,6 +154,7 @@ class WindowsInstallerTests(unittest.TestCase):
     def test_success_verifies_both_tasks_and_preserves_schedules(self):
         for shell in SHELLS:
             with self.subTest(shell=shell):
+                identity = current_user_identity(shell)
                 result, events = self.run_installer(shell, "success")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("两个定时任务已就位", result.stdout)
@@ -157,6 +168,7 @@ class WindowsInstallerTests(unittest.TestCase):
                     self.assertTrue(value["force"])
                     self.assertEqual(value["principal"]["RunLevel"], "Limited")
                     self.assertEqual(value["principal"]["LogonType"], "Interactive")
+                    self.assertEqual(value["principal"]["UserId"], identity)
                     self.assertEqual(value["settings"]["Seconds"], seconds)
                     self.assertTrue(value["settings"]["StartWhenAvailable"])
                     self.assertTrue(value["settings"]["Hidden"])
