@@ -1,7 +1,9 @@
 import json
+import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest import mock
 
 import qoder_signin as qoder
@@ -90,12 +92,51 @@ class AuthDiscoveryTests(unittest.TestCase):
     def test_missing_auth_dirs_raises_no_auth_not_format_error(self):
         # 消息里的字面 %APPDATA% 若不转义，% 格式化会先抛 ValueError，
         # 用户看到的就不是 NO_AUTH 而是“脚本运行异常”。
-        with mock.patch.object(qoder, "IS_WINDOWS", True), \
-             mock.patch.object(qoder, "find_auth_dirs", return_value=[]):
+        # load_session() 现在按平台分派，这里直接测 Windows 分支。
+        with mock.patch.object(qoder, "find_auth_dirs", return_value=[]):
             with self.assertRaises(qoder.NoAuthError) as ctx:
-                qoder.load_session()
+                qoder._load_session_windows()
         self.assertIn("%APPDATA%", str(ctx.exception))
         self.assertEqual(ctx.exception.looked_in, [])
+
+
+class WindowsLoadSessionTests(unittest.TestCase):
+    """Windows 分支的编排逻辑。
+
+    这里不碰 DPAPI（只在 Windows 上可用），但把「扫描目录 → 逐个读凭据 →
+    失败归并」这条骨架钉住：平台分派重构后，Windows 行为不应有任何变化。
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "com.qodercn.app.stable"
+        self.root.mkdir()
+        (self.root / "auth.v1.dat").write_bytes(b"v10" + b"\x00" * 64)
+
+    def test_returns_first_readable_session(self):
+        with mock.patch.object(qoder, "find_auth_dirs", return_value=[self.root]), \
+             mock.patch.object(qoder, "_read_auth_store_retry",
+                               return_value={"token": "dt-windows"}) as read:
+            session = qoder._load_session_windows()
+        self.assertEqual(session["token"], "dt-windows")
+        self.assertEqual(session["_auth_dir"], str(self.root))
+        read.assert_called_once_with(self.root)
+
+    def test_directory_without_credentials_is_no_auth(self):
+        (self.root / "auth.v1.dat").unlink()
+        with mock.patch.object(qoder, "find_auth_dirs", return_value=[self.root]):
+            with self.assertRaises(qoder.NoAuthError) as ctx:
+                qoder._load_session_windows()
+        self.assertIn("尚未登录", str(ctx.exception))
+
+    def test_format_error_is_aggregated_not_swallowed(self):
+        with mock.patch.object(qoder, "find_auth_dirs", return_value=[self.root]), \
+             mock.patch.object(qoder, "_read_auth_store_retry",
+                               side_effect=qoder.AuthFormatError("DECRYPT_FAILED")):
+            with self.assertRaises(qoder.AuthFormatError) as ctx:
+                qoder._load_session_windows()
+        self.assertIn("DECRYPT_FAILED", str(ctx.exception))
 
 
 class ClaimTests(unittest.TestCase):

@@ -10,8 +10,10 @@ Qoder CN 个人用户每天可在桌面端领取 100 通用 Credits。活动按 
   GET  {base}/sash/api/v1/me/campaigns
   POST {base}/sash/api/v1/me/campaigns/{campaignId}/claim      （幂等）
 
-凭据解密只用 Python 标准库 + Windows 自带的 DPAPI / CNG；装了 cryptography
-时优先用它，但不强依赖。任何模式下都不会打印令牌，也不会改写登录态文件。
+Windows 上凭据由 DPAPI + AES-256-GCM 保护，macOS 上由钥匙串 + AES-128-CBC
+保护。解密只用标准库 + 平台自带能力：Windows 用 DPAPI / CNG（装了 cryptography
+时优先用它），macOS 用钥匙串 + 客户端自带的 Electron 运行时（Node），都不强依赖
+第三方包。两种平台都不会打印令牌，也不会改写登录态文件。
 
 用法：
   python qoder_signin.py auto      # 领取今日 Credits，输出一行 JSON
@@ -29,6 +31,7 @@ import glob
 import json
 import os
 import platform
+import plistlib
 import socket
 import subprocess
 import sys
@@ -46,6 +49,13 @@ DEFAULT_BASE_URL = "https://openapi.qoder.com.cn"
 AUTH_DIR_GLOB = "com.qodercn.app*"
 AUTH_FILE = "auth.v1.dat"
 LOCAL_STATE_FILE = "Local State"
+
+# macOS：登录态目录与钥匙串条目。钥匙串里还有一条历史遗留的 "Qoder Safe
+# Storage"（属于另一套安装），认错条目会解不出内容，所以写死带 "CN" 的。
+MAC_KEYCHAIN_SERVICE = "Qoder CN App Safe Storage"
+MAC_KEYCHAIN_ACCOUNT = "Qoder CN App Key"
+MAC_HELPER_TIMEOUT = 20
+AUTH_INPUT_LIMIT = 65536
 
 # 缺这个头，服务端会返回空的活动列表。
 BASE_HEADERS = {
@@ -226,9 +236,238 @@ def _read_auth_store_retry(root, attempts=3):
     raise last
 
 
+# ---------------------------------------------------------------- macOS 登录态
+#
+# macOS 上 Qoder CN 的 auth.v1.dat 同样是 "v10" 前缀，但格式与 Windows 不同：
+#   Windows：v10 + 12 字节 nonce + AES-256-GCM（密钥由 DPAPI 保护）
+#   macOS  ：v10 + AES-128-CBC 密文（IV 固定为 16 个空格，PKCS7 填充），
+#            密钥 = PBKDF2-HMAC-SHA1(钥匙串密码, "saltysalt", 1003 轮, 16 字节)
+# Python 标准库没有 AES，所以只把「解密」这一步交给客户端自带的 Electron
+# 运行时（Node 自带 crypto），钥匙串读取仍在 Python 侧完成——这样两边都能
+# 单独测试，也不引入 cryptography 依赖。
+
+MAC_AUTH_HELPER_JS = r"""
+'use strict';
+const fs = require('fs');
+const crypto = require('crypto');
+const inputLimit = 65536;
+const failure = reason => { throw {reason}; };
+const object = x => x !== null && typeof x === 'object' && !Array.isArray(x);
+function utf8(bytes) {
+  const text = bytes.toString('utf8');
+  if (!Buffer.from(text, 'utf8').equals(bytes)) failure('INVALID_FORMAT');
+  return text;
+}
+function decrypt(request) {
+  if (!object(request) || typeof request.password !== 'string' || !request.password)
+    failure('INVALID_FORMAT');
+  if (typeof request.authFile !== 'string' || !request.authFile) failure('INVALID_FORMAT');
+  let raw;
+  try { raw = fs.readFileSync(request.authFile); }
+  catch (_) { failure('AUTH_MISSING'); }
+  if (raw.slice(0, 3).toString() !== 'v10') failure('UNSUPPORTED_FORMAT');
+  const key = crypto.pbkdf2Sync(request.password, 'saltysalt', 1003, 16, 'sha1');
+  let plain;
+  try {
+    const decipher = crypto.createDecipheriv('aes-128-cbc', key, Buffer.alloc(16, 0x20));
+    plain = Buffer.concat([decipher.update(raw.slice(3)), decipher.final()]);
+  } catch (_) { failure('DECRYPT_FAILED'); }
+  let session;
+  try { session = JSON.parse(utf8(plain)); }
+  catch (err) { failure(err.reason || 'UNSUPPORTED_FORMAT'); }
+  if (!object(session)) failure('UNSUPPORTED_FORMAT');
+  const token = session.token;
+  if (typeof token !== 'string' || !token.length || token.length > 32768 ||
+      !/^[A-Za-z0-9._~+\/-]+=*$/.test(token)) failure('TOKEN_MISSING');
+  return {token: token,
+          expiresAt: typeof session.expiresAt === 'string' ? session.expiresAt : null};
+}
+let chunks = [];
+let size = 0;
+function reply(value) {
+  process.stdout.write(JSON.stringify({version: 1, ...value}),
+                       () => process.exit(value.ok ? 0 : 1));
+}
+process.stdin.on('data', chunk => {
+  size += chunk.length;
+  if (size > inputLimit) reply({ok: false, reason: 'INVALID_FORMAT'});
+  else chunks.push(chunk);
+});
+process.stdin.on('error', () => reply({ok: false, reason: 'HELPER_PROTOCOL'}));
+process.stdin.on('end', () => {
+  try {
+    const request = JSON.parse(utf8(Buffer.concat(chunks)));
+    chunks = [];
+    reply({ok: true, session: decrypt(request)});
+  } catch (err) {
+    reply({ok: false, reason: (err && err.reason) || 'HELPER_PROTOCOL'});
+  }
+});
+"""
+
+
+def _mac_runtime(bundle):
+    """从 .app 包解析主可执行文件；规则与 signin.py 保持一致。"""
+    try:
+        with open(os.path.join(bundle, "Contents", "Info.plist"), "rb") as handle:
+            name = plistlib.load(handle).get("CFBundleExecutable")
+        if not isinstance(name, str) or not name or name in (".", "..") \
+                or "/" in name or "\\" in name:
+            return None
+        return os.path.join(bundle, "Contents", "MacOS", name)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+def find_mac_qoder_runtime():
+    override = os.environ.get("QODER_EXE")
+    if override:
+        path = os.path.abspath(os.path.expanduser(override))
+        if not os.path.isfile(path) or not os.access(path, os.X_OK):
+            raise NoAuthError("QODER_EXE 不是可用的可执行文件：%s" % path)
+        return path
+    home = os.path.expanduser("~")
+    candidates = [_mac_runtime(os.path.join(root, "Qoder CN.app"))
+                  for root in ("/Applications", os.path.join(home, "Applications"))]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return os.path.abspath(path)
+    raise NoAuthError("没找到 Qoder CN 客户端（/Applications/Qoder CN.app），"
+                      "请先安装并登录，或用 QODER_EXE 指定其可执行文件")
+
+
+def find_mac_auth_dirs():
+    override = os.environ.get("QODER_AUTH_DIR")
+    if override:
+        return [Path(override).expanduser()]
+    base = Path.home() / "Library" / "Application Support"
+    try:
+        roots = sorted(glob.glob(str(base / AUTH_DIR_GLOB)),
+                       key=os.path.getmtime, reverse=True)
+    except OSError:
+        roots = []
+    return [Path(r) for r in roots]
+
+
+def _mac_keychain_password():
+    """从登录钥匙串取加密密钥口令。进程首次访问可能弹出系统授权框。"""
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", MAC_KEYCHAIN_SERVICE,
+             "-a", MAC_KEYCHAIN_ACCOUNT, "-w"],
+            capture_output=True, text=True, timeout=10, shell=False)
+    except (OSError, subprocess.SubprocessError):
+        raise NoAuthError("读取钥匙串失败，请确认「钥匙串访问」可用") from None
+    password = (result.stdout or "").strip()
+    if result.returncode != 0 or not password:
+        raise NoAuthError("钥匙串中没有 %s（Qoder CN 可能未登录，或钥匙串已锁定）"
+                          % MAC_KEYCHAIN_SERVICE)
+    return password
+
+
+def _mac_auth_error(reason):
+    if reason == "AUTH_MISSING":
+        return NoAuthError("登录态文件不存在或不可读，请先打开 Qoder CN 桌面端完成登录")
+    if reason == "UNSUPPORTED_FORMAT":
+        return AuthFormatError("登录态格式无法识别，客户端可能已升级；请更新脚本")
+    if reason == "DECRYPT_FAILED":
+        return AuthFormatError("登录态解密失败（钥匙串密钥与凭据不匹配），请重新登录桌面端")
+    if reason == "TOKEN_MISSING":
+        return AuthFormatError("登录态中没有有效 token，请重新登录桌面端")
+    return AuthFormatError("登录态读取失败（%s）" % (reason or "UNKNOWN"))
+
+
+def _run_mac_auth_helper(exe, request):
+    """把密钥与凭据路径交给客户端自带的 Node 运行时解密，令牌经 stdout 返回。
+
+    环境变量里剔除 NODE_/ELECTRON_/QODER_ 前缀，避免外层 shell 的配置
+    （例如 ELECTRON_RUN_AS_NODE=0）干扰子进程。
+    """
+    data = json.dumps(dict(request, version=1), ensure_ascii=True).encode("ascii")
+    if len(data) > AUTH_INPUT_LIMIT:
+        raise AuthFormatError("登录态参数过大")
+    env = {key: value for key, value in os.environ.items()
+           if not key.upper().startswith(("NODE_", "ELECTRON_", "QODER_"))}
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    try:
+        process = subprocess.run([exe, "-e", MAC_AUTH_HELPER_JS], input=data,
+                                 capture_output=True, timeout=MAC_HELPER_TIMEOUT,
+                                 env=env, shell=False)
+    except subprocess.TimeoutExpired:
+        raise NoAuthError("登录态解密超时，请稍后重试") from None
+    except OSError:
+        raise NoAuthError("Qoder CN 客户端无法作为运行时启动，请检查安装是否完整") from None
+
+    try:
+        reply = json.loads(process.stdout.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise AuthFormatError("登录态助手返回了无法解析的结果") from None
+    if not isinstance(reply, dict) or reply.get("version") != 1:
+        raise AuthFormatError("登录态助手返回格式不符")
+    if reply.get("ok") is not True:
+        raise _mac_auth_error(reply.get("reason"))
+    session = reply.get("session")
+    if not isinstance(session, dict) or not isinstance(session.get("token"), str):
+        raise AuthFormatError("登录态助手没有返回 token")
+    return session
+
+
+def _read_mac_session_retry(runtime, root, password, attempts=3):
+    """客户端可能正在重写凭据，读到半截就短暂重试。
+
+    只重试格式/解密类失败；运行时缺失、钥匙串不可用属于确定性错误，重试
+    无意义（超时更不该重试三次，否则最坏要等 3 倍超时）。
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            return _run_mac_auth_helper(
+                runtime, {"password": password, "authFile": str(root / AUTH_FILE)})
+        except AuthFormatError as exc:
+            last = exc
+            if i + 1 < attempts:
+                time.sleep(0.25)
+    raise last
+
+
+def _load_session_mac():
+    runtime = find_mac_qoder_runtime()
+    dirs = find_mac_auth_dirs()
+    looked_in = [str(d) for d in dirs]
+    if not dirs:
+        raise NoAuthError("没找到 Qoder CN 登录态目录（~/Library/Application Support/%s），"
+                          "请先安装并登录 Qoder CN 桌面端" % AUTH_DIR_GLOB, looked_in)
+
+    candidates = [d for d in dirs if (d / AUTH_FILE).is_file()]
+    if not candidates:
+        raise NoAuthError("Qoder CN 桌面端尚未登录（%s）"
+                          % "；".join("%s: 未登录" % d.name for d in dirs), looked_in)
+
+    password = _mac_keychain_password()
+    errors = []
+    for root in candidates:
+        try:
+            session = _read_mac_session_retry(runtime, root, password)
+        except QoderAuthError as exc:
+            errors.append("%s: %s" % (root.name, exc))
+            continue
+        session["_auth_dir"] = str(root)
+        return session
+
+    raise AuthFormatError("Qoder CN 登录态读取失败（%s），请重新登录桌面端后重试"
+                          % "；".join(errors), looked_in)
+
+
 def load_session():
+    if sys.platform == "darwin":
+        return _load_session_mac()
     if not IS_WINDOWS:
-        raise NoAuthError("自动读取 Qoder CN 登录态只支持 Windows；其他平台请设置 QODER_TOKEN")
+        raise NoAuthError("自动读取 Qoder CN 登录态支持 Windows 与 macOS；"
+                          "其他平台请设置 QODER_TOKEN")
+    return _load_session_windows()
+
+
+def _load_session_windows():
     dirs = find_auth_dirs()
     looked_in = [str(d) for d in dirs]
     if not dirs:
