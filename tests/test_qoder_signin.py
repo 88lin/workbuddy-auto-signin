@@ -90,10 +90,10 @@ class AuthDiscoveryTests(unittest.TestCase):
     def test_missing_auth_dirs_raises_no_auth_not_format_error(self):
         # 消息里的字面 %APPDATA% 若不转义，% 格式化会先抛 ValueError，
         # 用户看到的就不是 NO_AUTH 而是“脚本运行异常”。
-        with mock.patch.object(qoder, "IS_WINDOWS", True), \
-             mock.patch.object(qoder, "find_auth_dirs", return_value=[]):
+        # load_session() 现在按平台分派，这里直接测 Windows 分支。
+        with mock.patch.object(qoder, "find_auth_dirs", return_value=[]):
             with self.assertRaises(qoder.NoAuthError) as ctx:
-                qoder.load_session()
+                qoder._load_session_windows()
         self.assertIn("%APPDATA%", str(ctx.exception))
         self.assertEqual(ctx.exception.looked_in, [])
 

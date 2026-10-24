@@ -1,0 +1,28 @@
+{
+  "_comment": "由 npm run 之外的一次性脚本生成：v10 + AES-128-CBC(PBKDF2(password, saltysalt, 1003, 16), IV=16 空格)",
+  "password": "synthetic-keychain-password",
+  "cases": {
+    "valid": {
+      "blob": "djEwz64QenXcttEtAxcX6guQSZeDco/lm7juH7l6Q4zeG1p5HlJ0Y1pS7rImhZ/N5mznvIRzBbukG0mVjE1PfzG2tZOFX3UGmjIFAPJuUEvl5GL7qZy+wtd66koKCHM+hD64UBd5xc6mXT3Bda/j9K/6xSM4RScRNrV6sfUkQ9OQf17NBrW/9qFeokvfyDko6DhyUaVcOkDPwjGAZxqM9asXfYxFq/lMw+tcxoUM2EATuISYh/PNMsopR24rkf/yHCgNc5Uyz/gyCARX2tubFVPNIX7sIEW7h24Oq7RlknPLA1BVio1ofgAQe1CnkEbIc1lz",
+      "expect_token": "dt-synthetic-token-1234567890"
+    },
+    "expired_token_field": {
+      "blob": "djEwfuaZvJlOJLlJVX8B8qxH1ZbYbNbluOvrysjY4syS8qg="
+    },
+    "bad_token_chars": {
+      "blob": "djEwN0GLhqhtQbtA02tJEf1GffEVvbcJAiKVKPMX/eNWHZZMIcpTOY1oHH+RJBOqmekI"
+    },
+    "not_object": {
+      "blob": "djEwb+MTXQc8zfXrSZWY8i4RTLl+afABVwMC/aMG8F/XRnM="
+    },
+    "invalid_json": {
+      "blob": "djEw99JsVceAeC3OjoZNflMBWnLy3Z3Tcwu2LXV3IMESsxM="
+    },
+    "wrong_prefix": {
+      "blob": "djExeHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg="
+    },
+    "truncated": {
+      "blob": "djEwc2hvcnQ="
+    }
+  }
+}
