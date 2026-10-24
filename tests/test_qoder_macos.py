@@ -147,11 +147,16 @@ class RuntimeDiscoveryTests(unittest.TestCase):
         return str(self.root / "Qoder CN.app"), binary
 
     def test_override_requires_executable_file(self):
+        # 不用真实的 chmod 断言：Windows 上 os.access(path, os.X_OK) 对任何
+        # 存在的文件都为真（没有 POSIX 可执行位），真实语义只有 macOS 才有。
+        # 这里 mock 掉 access 的返回值，验证代码确实尊重它，三个平台一致。
         bundle, binary = self.bundle()
-        with mock.patch.dict(os.environ, {"QODER_EXE": str(binary)}):
+        with mock.patch.dict(os.environ, {"QODER_EXE": str(binary)}), \
+             mock.patch.object(qoder.os, "access", return_value=False):
             with self.assertRaises(qoder.NoAuthError):
-                qoder.find_mac_qoder_runtime()   # 尚未 chmod +x
-            binary.chmod(0o755)
+                qoder.find_mac_qoder_runtime()
+        with mock.patch.dict(os.environ, {"QODER_EXE": str(binary)}), \
+             mock.patch.object(qoder.os, "access", return_value=True):
             self.assertEqual(qoder.find_mac_qoder_runtime(), os.path.abspath(binary))
 
     def test_info_plist_resolves_executable(self):
