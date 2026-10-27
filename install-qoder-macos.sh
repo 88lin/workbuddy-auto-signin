@@ -11,6 +11,12 @@
 #
 # 与 Windows 版 install-qoder-windows.ps1 的排程一致；领取接口幂等，
 # 已领过只会查询，不会重复领。
+#
+# 失败处理原则（评审意见 #24）：
+#   · plist 用 plistlib 生成，路径里的 & < > 不会破坏 XML
+#   · 先生成并校验临时 plist，全部通过后才替换配置、注销旧任务
+#   · 备份失败立即退出，保留原任务；bootstrap 失败自动回滚
+#   · 自检与定时任务使用同一套环境变量（QODER_EXE / QODER_AUTH_DIR）
 set -u
 
 LABEL="qoder-daily-credits"
@@ -19,12 +25,20 @@ BACKUP="$PLIST.bak"
 LOGDIR="$HOME/Library/Logs/QoderDailyCredits"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$DIR/qoder_signin.py"
-ERRTMP="$(mktemp -t qoder-signin-boot)" || ERRTMP="/tmp/qoder-signin-boot.$$"
+
+TMPPLIST=""
+ERRTMP=""
+cleanup() {
+  [ -n "$TMPPLIST" ] && rm -f "$TMPPLIST"
+  [ -n "$ERRTMP" ] && rm -f "$ERRTMP"
+}
+trap cleanup EXIT
 
 # launchctl print 才是权威查询；`launchctl list | grep` 在部分环境会漏判。
 is_loaded() {
   launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1
 }
+die() { echo "✗ $*" >&2; exit 1; }
 
 # ── Python 解释器 ────────────────────────────────────────────
 # 别用 /usr/bin/python3：没装 Xcode Command Line Tools 时它只是占位壳，
@@ -61,6 +75,9 @@ if [ ! -f "$SCRIPT" ]; then
 fi
 
 # ── 登录态自检：不联网、不领取 ────────────────────────────────
+# 注意：这里用到的 QODER_EXE / QODER_AUTH_DIR 必须一并写进 plist，
+# 否则会出现「自检通过、安装成功，launchd 里却报 NO_AUTH」——
+# launchd 不继承安装时终端的环境变量。
 echo "[0/3] 登录态自检（不联网、不领取）"
 if DOCTOR="$("$PYTHON" "$SCRIPT" doctor 2>&1)"; then
   echo "  ✓ $DOCTOR"
@@ -70,118 +87,98 @@ else
   exit 1
 fi
 
-mkdir -p "$HOME/Library/LaunchAgents" "$LOGDIR"
+mkdir -p "$HOME/Library/LaunchAgents" "$LOGDIR" || die "无法创建 $HOME/Library/LaunchAgents 或 $LOGDIR"
+TMPPLIST="$(mktemp "${TMPDIR:-/tmp}/$LABEL.plist.XXXXXX")" || die "无法创建临时文件"
+ERRTMP="$(mktemp "${TMPDIR:-/tmp}/$LABEL.boot.XXXXXX")" || true
 
-# ── 备份 ─────────────────────────────────────────────────────
-# 顺序必须是「先备份，再 bootout 旧任务」。只做「bootout → bootstrap」的话，
-# 一旦 bootstrap 失败，系统会停在旧任务已卸载、新任务装不回来的状态。
-if [ -f "$PLIST" ]; then
-  cp "$PLIST" "$BACKUP" && echo "[1/3] 已备份现有配置 → $BACKUP"
+# ── 生成 plist（plistlib，自动转义 XML）──────────────────────
+# 直接拼 XML 时，路径里出现 & < > 会让 plist 无法解析；
+# 用标准库生成可彻底避免这类问题。
+echo "[1/3] 生成 launchd 配置"
+if ! PL_LABEL="$LABEL" PL_PYTHON="$PYTHON" PL_SCRIPT="$SCRIPT" PL_DIR="$DIR" \
+     PL_LOGDIR="$LOGDIR" PL_EXE="${QODER_EXE:-}" PL_AUTHDIR="${QODER_AUTH_DIR:-}" \
+     "$PYTHON" - "$TMPPLIST" <<'PYEOF'
+import os
+import plistlib
+import sys
+
+schedule = (10, 11, 15, 19, 23)
+
+# 只透传「非敏感」的配置；访问令牌一律不写入 plist。
+env = {"PYTHONIOENCODING": "utf-8"}
+if os.environ.get("PL_EXE", "").strip():
+    env["QODER_EXE"] = os.environ["PL_EXE"].strip()
+if os.environ.get("PL_AUTHDIR", "").strip():
+    env["QODER_AUTH_DIR"] = os.environ["PL_AUTHDIR"].strip()
+
+plist = {
+    "Label": os.environ["PL_LABEL"],
+    "ProgramArguments": [os.environ["PL_PYTHON"], os.environ["PL_SCRIPT"], "auto"],
+    "WorkingDirectory": os.environ["PL_DIR"],
+    "StartCalendarInterval": [{"Hour": hour, "Minute": 5} for hour in schedule],
+    "RunAtLoad": True,
+    "ProcessType": "Background",
+    "EnvironmentVariables": env,
+    "StandardOutPath": os.path.join(os.environ["PL_LOGDIR"], "out.log"),
+    "StandardErrorPath": os.path.join(os.environ["PL_LOGDIR"], "err.log"),
+}
+
+with open(sys.argv[1], "wb") as handle:
+    plistlib.dump(plist, handle)
+PYEOF
+then
+  die "生成 plist 失败"
 fi
 
-echo "[1/3] 写入 launchd 配置 → $PLIST"
-cat > "$PLIST" <<PLISTEOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${LABEL}</string>
+# 用真实解析器校验，避免写出「语法看起来对但 launchd 读不了」的文件
+if command -v plutil >/dev/null 2>&1; then
+  plutil -lint "$TMPPLIST" >/dev/null 2>&1 || die "生成的 plist 无法解析，已中止（未改动现有任务）"
+fi
+echo "  ✓ 配置已生成并校验"
 
-    <key>ProgramArguments</key>
-    <array>
-        <string>${PYTHON}</string>
-        <string>${SCRIPT}</string>
-        <string>auto</string>
-    </array>
+# ── 备份 ─────────────────────────────────────────────────────
+# 顺序必须是「先备份，再替换/注销」。备份失败说明后续没有任何退路，
+# 此时必须直接退出并保留原任务，绝不能继续覆盖配置。
+if [ -f "$PLIST" ]; then
+  if ! cp "$PLIST" "$BACKUP"; then
+    die "备份现有配置失败（$BACKUP）。已中止，原任务未被改动"
+  fi
+  echo "  ✓ 已备份现有配置 → $BACKUP"
+fi
 
-    <key>WorkingDirectory</key>
-    <string>${DIR}</string>
-
-    <!-- 固定时刻触发（不用 StartInterval：它从加载时刻起算，时刻会漂移，
-         重启后基准也会变；独立触发器每次错过都会在下次开机时补跑）-->
-    <key>StartCalendarInterval</key>
-    <array>
-        <dict>
-            <key>Hour</key>
-            <integer>10</integer>
-            <key>Minute</key>
-            <integer>5</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>11</integer>
-            <key>Minute</key>
-            <integer>5</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>15</integer>
-            <key>Minute</key>
-            <integer>5</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>19</integer>
-            <key>Minute</key>
-            <integer>5</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>23</integer>
-            <key>Minute</key>
-            <integer>5</integer>
-        </dict>
-    </array>
-
-    <!-- 登录时立即跑一次，补上关机/睡眠期间错过的领取 -->
-    <key>RunAtLoad</key>
-    <true/>
-
-    <!-- launchd 的环境里通常连 LANG 都没有，不钉死 UTF-8 时中文汇报可能
-         UnicodeEncodeError，表现为 .out 空、.err 里一堆编码错误 -->
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PYTHONIOENCODING</key>
-        <string>utf-8</string>
-    </dict>
-
-    <key>StandardOutPath</key>
-    <string>${LOGDIR}/out.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>${LOGDIR}/err.log</string>
-</dict>
-</plist>
-PLISTEOF
+# 校验通过、备份就绪，才真正替换配置
+if ! mv -f "$TMPPLIST" "$PLIST"; then
+  die "写入 $PLIST 失败"
+fi
+TMPPLIST=""
 
 # ── 注册 ─────────────────────────────────────────────────────
 echo "[2/3] 注册服务"
-launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+if is_loaded; then
+  if ! launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null; then
+    # 旧任务没注销掉，新配置也还没生效：恢复备份，保持原状
+    if [ -f "$BACKUP" ]; then
+      cp "$BACKUP" "$PLIST" && echo "  ↺ 已恢复原配置"
+    fi
+    die "注销旧任务失败，已中止（原任务状态未变）"
+  fi
+fi
+
 if ! launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>"$ERRTMP"; then
   echo "  ✗ bootstrap 失败：$(head -1 "$ERRTMP" 2>/dev/null)"
-  # 旧任务已被 bootout，此刻处于无任务状态 —— 立刻用备份回滚
   if [ -f "$BACKUP" ]; then
     echo "  ↺ 正在用备份恢复原配置…"
-    cp "$BACKUP" "$PLIST"
+    cp "$BACKUP" "$PLIST" || die "恢复备份失败，请手动执行：launchctl bootstrap gui/\$(id -u) \"$PLIST\""
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || true
     sleep 2
     if is_loaded; then
-      echo "  ✓ 已回滚到原配置，定时任务仍在运行（新配置未生效）"
-      rm -f "$ERRTMP"
-      exit 1
+      die "新配置注册失败，已回滚到原配置（定时任务仍在运行）"
     fi
-    echo "  ✗ 回滚也失败了"
-  else
-    echo "  ✗ 没有可用备份"
+    die "回滚也失败，请手动执行：launchctl bootstrap gui/\$(id -u) \"$PLIST\""
   fi
-  echo
-  echo "请手动执行： launchctl bootstrap gui/\$(id -u) \"$PLIST\""
-  rm -f "$ERRTMP"
-  exit 1
+  die "注册失败且没有可用备份"
 fi
-rm -f "$ERRTMP"
 sleep 2
 
 # ── 验证 ─────────────────────────────────────────────────────
@@ -204,6 +201,11 @@ echo "Python：  $PYTHON"
 echo "日志目录：$LOGDIR"
 echo "  out.log  每次运行的汇报（一行 JSON）"
 echo "  err.log  报错（解密失败、Python 异常、权限问题）"
+if [ -n "${QODER_EXE:-}" ] || [ -n "${QODER_AUTH_DIR:-}" ]; then
+  echo "已写入 plist 的自定义配置："
+  [ -n "${QODER_EXE:-}" ] && echo "  QODER_EXE=$QODER_EXE"
+  [ -n "${QODER_AUTH_DIR:-}" ] && echo "  QODER_AUTH_DIR=$QODER_AUTH_DIR"
+fi
 echo
 echo "最近一次运行输出："
 sleep 1
@@ -216,6 +218,8 @@ echo
 echo "说明："
 echo "  · Credits 按 UTC+8 每天 10:00 刷新，窗口 10:00 ~ 次日 09:59；"
 echo "    窗口内任意一次触发领取都有效，过期不补领。"
+echo "  · 国际版活动实例的下发可能比 10:00 晚几分钟到几十分钟，"
+echo "    11:05 起的兜底触发会接住。"
 echo "  · 令牌由桌面端负责刷新；长期不打开 Qoder CN 导致过期时，"
 echo "    err.log 会出现 AUTH_REJECTED / 解密失败，打开一次桌面端即可恢复。"
 echo "  · 首次运行可能弹出钥匙串授权框（读取 Qoder CN Safe Storage），"
