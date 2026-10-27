@@ -1179,9 +1179,15 @@ def run_growth(headers, endpoint):
                 loc = locs[0]
                 dcode, dbody = post(base + "/buddy/travel/depart", headers,
                                     {"location_id": loc.get("id")})
-                if _check_auth(dcode):
+                dmsg = str(dig(dbody, "msg") or "")
+                if dcode == 403 and dmsg and dmsg.lower() != "forbidden":
+                    # 403 也可能是业务状态而非认证失败（实测账号未领养 Buddy 时
+                    # 返回 no active buddy）。这类情况只跳过旅行模块，不能让整轮
+                    # 成长中心中止——后面的任务、连登、兑换本来都是可用的。
+                    parts.append("派 Buddy 跳过：%s" % dmsg)
+                elif _check_auth(dcode):
                     return 1, _auth_failure(dcode)
-                if 200 <= dcode < 300:
+                elif 200 <= dcode < 300:
                     loc_name = (dig(dbody, "location") or {}).get("name", "?")
                     dur = dig(dbody, "duration_hours") or (dig(dbody, "location") or {}).get("duration_hours", "?")
                     parts.append("派 Buddy 去%s（%s 小时后回）" % (loc_name, dur))
