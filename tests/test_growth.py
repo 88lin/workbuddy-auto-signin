@@ -264,5 +264,106 @@ class MakeupTests(unittest.TestCase):
             self.assertNotIn("synthetic-token", json.dumps(entry))
 
 
+class BuddyBlindBoxGuardTests(unittest.TestCase):
+    """开 Buddy 盲盒会覆盖当前旅行记录，所以旅行流程没走完时不能让第 6 步动手。
+
+    Regression: 2026-10-27，11 点派出的 Buddy 应在 12:06 带礼物回来，
+    而 12:05 那轮因为能量刚好够 10 点就开了盲盒，旅行记录连同礼物一起消失。
+    """
+
+    def setUp(self):
+        signin._start_budget()
+        self.gets = []
+        self.writes = []
+        self.responses = {
+            "/tasks": response({"tasks": []}),
+            "/streak": response({"streak": {"days": 1}, "makeup_cards": {"balance": 0}}),
+            "/heatmap": response({"today": {"date": "2026-10-27"}, "cells": []}),
+            "/redeem/summary": response({"starter_status": "locked",
+                                         "advanced_status": "locked",
+                                         "legendary_status": "locked"}),
+            "/lottery/chances": response({"balance": 0}),
+            "/buddy/quota": response({"affordable": 3, "max_open_count": 1}),
+            "/energy": response({"balance": 8}),
+            "/buddy/travel/config": response({"locations": [{"id": 1, "name": "咖啡馆",
+                                                             "duration_hours": 1}]}),
+        }
+        self.set_travel("traveling")
+        self.claim_fails = False
+        self.get_patch = patch.object(signin, "get", side_effect=self.get)
+        self.post_patch = patch.object(signin, "post", side_effect=self.post)
+        self.get_patch.start()
+        self.post_patch.start()
+        self.addCleanup(self.get_patch.stop)
+        self.addCleanup(self.post_patch.stop)
+
+    def set_travel(self, state, daily_limit=False):
+        self.responses["/buddy/travel/status"] = response({
+            "state": state, "record_id": 3, "daily_limit_reached": daily_limit,
+            "location": {"name": "咖啡馆"}, "arrive_at": 0, "server_now": 0})
+
+    def get(self, url, headers):
+        path = url.split("/v2/activity/growth", 1)[1]
+        self.gets.append(path)
+        if path not in self.responses:
+            return response({})
+        return copy.deepcopy(self.responses[path])
+
+    def post(self, url, headers, payload=None, **kwargs):
+        path = url.split("/v2/activity/growth", 1)[1]
+        self.writes.append(path)
+        if path == "/buddy/travel/claim":
+            if self.claim_fails:
+                return 500, {"msg": "claim failed"}
+            return response({"reward_credit": 50})
+        if path == "/buddy/travel/depart":
+            return response({"location": {"name": "咖啡馆"}, "duration_hours": 1})
+        if path == "/buddy/open":
+            return response({"buddy": "新伙伴"})
+        return response({})
+
+    def opened(self):
+        return self.writes.count("/buddy/open")
+
+    def run_growth(self):
+        code, out = signin.run_growth({}, "https://test.invalid")
+        # 有的用例故意制造失败（领奖 500、状态 503），此时返回 1 是既有约定；
+        # 这里只关心盲盒开没开，所以不断言 code。
+        self.assertIn(code, (0, 1))
+        self.assertNotEqual(out.get("result"), "AUTH")
+        return out
+
+    def test_traveling_skips_blind_box(self):
+        out = self.run_growth()
+        self.assertEqual(self.opened(), 0)
+        self.assertIn("盲盒跳过", out["report"])
+
+    def test_unclaimed_gift_skips_blind_box(self):
+        # 已到家但领取失败：记录还在，开盲盒会把它抹掉
+        self.set_travel("arrived")
+        self.claim_fails = True
+        self.run_growth()
+        self.assertEqual(self.opened(), 0)
+
+    def test_fresh_departure_skips_blind_box(self):
+        # 礼物已领到并立刻派出新行程：这时开盲盒等于白扔当天那一次出发名额
+        self.set_travel("arrived")
+        self.run_growth()
+        self.assertEqual(self.writes.count("/buddy/travel/depart"), 1)
+        self.assertEqual(self.opened(), 0)
+
+    def test_idle_with_quota_used_still_opens(self):
+        # 常态：今天名额已用完、Buddy 在家，盲盒照开，不能被守卫误伤
+        self.set_travel("idle", daily_limit=True)
+        self.run_growth()
+        self.assertEqual(self.opened(), 1)
+
+    def test_unknown_state_falls_back_to_opening(self):
+        # 状态取不到就不该擅自拦截
+        self.responses["/buddy/travel/status"] = (503, {"msg": "unavailable"})
+        self.run_growth()
+        self.assertEqual(self.opened(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

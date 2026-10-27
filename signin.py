@@ -1131,6 +1131,10 @@ def run_growth(headers, endpoint):
         return True
 
     # --- 1. Buddy 旅行：领礼物 + 派出发 ---
+    # 旅行状态要跨步骤传下去：第 6 步的「Buddy 盲盒」会把当前旅行记录整个覆盖掉，
+    # 若此时还有礼物没领（traveling 在路上 / arrived 但领取失败），开盲盒等于把它扔了。
+    # None 表示这一步没取得状态（异常或非 2xx），此时第 6 步按原逻辑放行。
+    travel_state = None
     try:
         scode, sbody = get(base + "/buddy/travel/status", headers)
         if scode == CODE_BUDGET_OUT:
@@ -1192,6 +1196,9 @@ def run_growth(headers, endpoint):
                     dur = dig(dbody, "duration_hours") or (dig(dbody, "location") or {}).get("duration_hours", "?")
                     parts.append("派 Buddy 去%s（%s 小时后回）" % (loc_name, dur))
                     successes += 1
+                    # 刚派出去，此刻 Buddy 已经在路上：状态要跟着变，
+                    # 否则第 6 步会以为它还在 idle 而开盲盒，把刚出发的行程抹掉。
+                    travel = "traveling"
                 else:
                     msg = dig(dbody, "msg") or ""
                     parts.append("派 Buddy 失败：%s" % (msg or "HTTP %s" % dcode))
@@ -1202,6 +1209,8 @@ def run_growth(headers, endpoint):
             # arrive_at / server_now 是服务端时间戳，比本地时钟可靠
             parts.append("Buddy 旅行中（%s%s）" % (
                 loc_name, _fmt_eta(dig(sbody, "arrive_at"), dig(sbody, "server_now"))))
+        # 走到这里 travel 已经是本轮的最终态（含「刚派出」和「领完礼物转 idle」两种修正）
+        travel_state = travel
     except Exception as e:
         parts.append("旅行模块异常（%s: %s）" % (type(e).__name__, e))
         failures += 1
@@ -1461,7 +1470,13 @@ def run_growth(headers, endpoint):
             hard_failures += 1
 
     # --- 6. Buddy 盲盒（能量攒够 cost_per_open 就开；能量没有其它消耗出口）---
-    if _budget_left() <= 0:
+    # 但开盲盒会覆盖当前旅行记录：Buddy 还在路上、或已到家但礼物没领到时开，
+    # 那份礼物就跟着记录一起消失（曾实测：12:05 开盲盒，12:06 该到家的礼物没了）。
+    # 旅行态就跳过，礼物领完、Buddy 回到 idle 后的下一轮再开——能量不会过期。
+    if travel_state in ("traveling", "arrived"):
+        parts.append("Buddy 盲盒跳过：Buddy 还在旅行流程里（%s），先保住待领礼物"
+                     % ("行程中" if travel_state == "traveling" else "礼物待领"))
+    elif _budget_left() <= 0:
         parts.append("时间预算耗尽，Buddy 盲盒跳过")
     else:
         try:
