@@ -394,10 +394,17 @@ Windows 按 `WORKBUDDY_EXE → 默认安装目录 → 注册表` 的顺序发现
 
 ### 前置条件
 
-- 已安装并**登录过 Qoder CN 桌面端**（Windows）
+- 已安装并**登录过 Qoder CN 桌面端**（Windows / macOS）
 - 本机有 **Python 3**（与 WorkBuddy 共用即可，无第三方包）
 
-> 自动读取登录态目前只支持 **Windows**（凭据由 DPAPI + AES-GCM 保护）。macOS / Linux 想用可以设 `QODER_TOKEN`，但令牌会过期，不推荐长期保存。
+> 自动读取登录态支持 **Windows** 与 **macOS**：
+>
+> - **Windows**：凭据由 DPAPI 保护，密钥从 `Local State` 解出，AES-256-GCM 解密。
+> - **macOS**：密钥在登录钥匙串（`Qoder CN App Safe Storage`），凭据是 AES-128-CBC。
+>   Python 标准库没有 AES，这一步交给客户端自带的 Electron 运行时（Node）完成，
+>   所以同样不需要 `pip install`。
+>
+> Linux 暂无自动读取，可设 `QODER_TOKEN`，但令牌会过期，不推荐长期保存。
 
 ### 一键安装（Windows）
 
@@ -415,6 +422,26 @@ powershell -ExecutionPolicy Bypass -File .\install-qoder-windows.ps1
 
 > [!NOTE]
 > 脚本**不会**自动使用 refresh token 续期。这样不会和桌面端争抢刷新令牌轮换，代价是登录态过期后需要你打开一次 Qoder CN 桌面端。输出里的 `token_expires_at` 是当前令牌的到期时间；`AUTH_REJECTED` 就是提醒你重新登录。
+
+### 一键安装（macOS）
+
+```bash
+bash install-qoder-macos.sh
+```
+
+只创建一个 launchd 任务（`qoder-daily-credits`），不碰 WorkBuddy 的两个任务：
+
+| 任务 | 触发 | 干什么 |
+|---|---|---|
+| `qoder-daily-credits` | 每天 10:05，另加 11:05 / 15:05 / 19:05 / 23:05 | 查询并领取，每轮一行 JSON 写入 `~/Library/Logs/QoderDailyCredits/out.log` |
+
+安装脚本会先跑一次 `doctor` 自检（不联网、不领取），通过后才注册；注册失败会用备份自动回滚，不会把已有任务弄丢。
+自检会忽略终端里的临时 `QODER_TOKEN`，确认桌面登录态可用；自定义的 `QODER_EXE` / `QODER_AUTH_DIR` 会按安装时的当前目录展开为绝对路径，用于自检并保存到后台任务。
+
+> [!NOTE]
+> macOS 上首次读取登录态时，系统可能弹出钥匙串授权框（`Qoder CN App Safe Storage`）。选「始终允许」，否则后台任务会卡在等待授权。
+>
+> Python 解释器优先取 `/opt/homebrew/bin/python3` 或 `/usr/local/bin/python3`（Intel 机），找不到才用 `PATH` 里的；`/usr/bin/python3` 在没有 Xcode Command Line Tools 时只是占位壳，装了 launchd 任务会静默失败。要强制指定可用 `QODER_PYTHON=/path/to/python3 bash install-qoder-macos.sh`。
 
 ### 手动运行 / 自检
 
@@ -435,14 +462,21 @@ python qoder_signin.py auto            # 真的领取（幂等）
 Unregister-ScheduledTask -TaskName "QoderDailyCredits" -Confirm:$false
 ```
 
+macOS：
+
+```bash
+bash uninstall-qoder-macos.sh
+```
+
 ### 配置
 
 | 环境变量 | 作用 |
 |---|---|
-| `QODER_AUTH_DIR` | 指定 Qoder CN 数据目录；默认自动扫描 `%APPDATA%\com.qodercn.app*` |
-| `QODER_TOKEN` | 手动提供 access token（非 Windows 或调试用；优先于本地登录态） |
+| `QODER_AUTH_DIR` | 指定 Qoder CN 数据目录；Windows 默认扫描 `%APPDATA%\com.qodercn.app*`，macOS 默认扫描 `~/Library/Application Support/com.qodercn.app*` |
+| `QODER_TOKEN` | 手动提供 access token（Linux 或调试用；优先于本地登录态） |
 | `QODER_BASE_URL` | 覆盖 API 端点，默认 `https://openapi.qoder.com.cn` |
-| `QODER_UMID_EXE` | 指定客户端自带的 `runtime-info.exe`（自动探测失败时） |
+| `QODER_EXE` | macOS：指定 Qoder CN 可执行文件（默认 `/Applications/Qoder CN.app`） |
+| `QODER_UMID_EXE` | 指定客户端自带的 `runtime-info.exe`（Windows；自动探测失败时） |
 | `QODER_SIGNIN_LOG` | `silent` 模式的日志路径（默认 `qoder_signin.log`） |
 | `QODER_SIGNIN_LOG_EMPTY=1` | 空跑也写日志 |
 
