@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 """macOS 安装/卸载脚本的回归测试（仅 darwin 运行）
 
-覆盖 PR #24 review 指出的四个问题：
+覆盖 PR #24 review 指出的问题：
   1. 自检用到的 QODER_EXE / QODER_AUTH_DIR 必须写进 plist（launchd 不继承终端环境）
   2. 备份失败必须中止，不能继续覆盖配置并卸载旧任务
   3. 注销失败必须保留配置并返回非零
   4. 路径含 & < > 时 plist 仍必须是合法 XML
+  5. 临时 QODER_TOKEN 不能绕过桌面登录态自检
+  6. 自定义路径在自检与后台任务中必须指向同一位置
 
 做法：把两个脚本复制到名字带「&」的临时目录，用假的 qoder_signin.py 顶替自检，
 PATH 里放一个 launchctl 影子程序模拟加载状态与失败分支。不触碰真实用户任务。
@@ -37,6 +39,31 @@ import sys
 if "doctor" not in sys.argv:
     sys.exit(2)
 print('{"result": "OK", "credential_format": "sym-v1"}')
+"""
+
+DESKTOP_DOCTOR = """\
+import json
+import os
+from pathlib import Path
+import qoder_core as qoder
+
+seen = {name: os.environ.get(name) for name in ("QODER_EXE", "QODER_AUTH_DIR")}
+seen["has_env_token"] = bool(os.environ.get("QODER_TOKEN"))
+Path(__file__).with_name("doctor-env.json").write_text(json.dumps(seen), encoding="utf-8")
+
+def desktop_session():
+    exe = Path(os.environ["QODER_EXE"]).expanduser()
+    auth = Path(os.environ["QODER_AUTH_DIR"]).expanduser()
+    if not exe.is_file() or not (auth / "auth.v1.dat").is_file():
+        raise qoder.NoAuthError("synthetic desktop credentials missing")
+    return {"token": "dt-synthetic-desktop", "expiresAt": "2099-01-01T00:00:00Z",
+            "_auth_dir": str(auth)}
+
+# 保留真实 doctor 的 token 优先级，只替换本机凭据与设备访问。
+qoder.load_session = desktop_session
+qoder._umid_candidates = lambda: []
+qoder.risk_headers = lambda auth_dir: {}
+raise SystemExit(qoder.main())
 """
 
 FAKE_LAUNCHCTL = """\
@@ -106,10 +133,10 @@ class InstallerHarness(unittest.TestCase):
         env.update(extra)
         return env
 
-    def run_script(self, name, **extra):
+    def run_script(self, name, cwd=None, **extra):
         return subprocess.run(
             ["/bin/bash", os.path.join(self.repo, name)],
-            cwd=self.repo, env=self.env(**extra),
+            cwd=cwd or self.repo, env=self.env(**extra),
             capture_output=True, text=True, timeout=120)
 
     def read_plist(self):
@@ -119,6 +146,81 @@ class InstallerHarness(unittest.TestCase):
 
 @DARWIN_ONLY
 class InstallerTests(InstallerHarness):
+    def use_desktop_doctor(self, base):
+        shutil.copy(os.path.join(SCRIPT_DIR, "qoder_signin.py"),
+                    os.path.join(self.repo, "qoder_core.py"))
+        with open(self.script, "w", encoding="utf-8") as handle:
+            handle.write(DESKTOP_DOCTOR)
+        exe = os.path.join(base, "Qoder CN")
+        auth = os.path.join(base, "auth & files")
+        os.makedirs(auth)
+        with open(exe, "w", encoding="utf-8") as handle:
+            handle.write("synthetic runtime")
+        with open(os.path.join(auth, "auth.v1.dat"), "wb") as handle:
+            handle.write(b"synthetic credentials")
+        return {"QODER_EXE": exe, "QODER_AUTH_DIR": auth}
+
+    def read_doctor_env(self):
+        with open(os.path.join(self.repo, "doctor-env.json"), encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_env_token_cannot_bypass_missing_desktop_credentials(self):
+        config = self.use_desktop_doctor(self.root)
+        os.remove(os.path.join(config["QODER_AUTH_DIR"], "auth.v1.dat"))
+        original = b"<plist>ORIGINAL</plist>"
+        with open(self.plist, "wb") as handle:
+            handle.write(original)
+        os.makedirs(self.state)
+        open(os.path.join(self.state, "loaded"), "w").close()
+
+        result = self.run_script(INSTALLER, QODER_TOKEN="dt-synthetic-env", **config)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("NO_AUTH", result.stdout)
+        self.assertNotIn("dt-synthetic-env", result.stdout + result.stderr)
+        with open(self.plist, "rb") as handle:
+            self.assertEqual(handle.read(), original)
+        self.assertTrue(os.path.isfile(os.path.join(self.state, "loaded")))
+
+    def test_env_token_is_ignored_when_desktop_credentials_are_available(self):
+        config = self.use_desktop_doctor(self.root)
+        result = self.run_script(INSTALLER, QODER_TOKEN="dt-synthetic-env", **config)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.read_doctor_env()["has_env_token"])
+        self.assertIn('"token_source": "desktop"', result.stdout)
+        self.assertNotIn("QODER_TOKEN", self.read_plist()["EnvironmentVariables"])
+        self.assertNotIn("dt-synthetic-env", result.stdout + result.stderr)
+
+    def assert_paths_work_after_directory_change(self, home_relative=False):
+        caller = os.path.realpath(os.path.join(self.root, "caller"))
+        os.makedirs(caller)
+        base = self.home if home_relative else caller
+        config = self.use_desktop_doctor(base)
+        supplied = {name: ("~/" if home_relative else "./") + os.path.relpath(path, base)
+                    for name, path in config.items()}
+        result = self.run_script(INSTALLER, cwd=caller, **supplied)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        data = self.read_plist()
+        seen = self.read_doctor_env()
+        for name, expected in config.items():
+            self.assertEqual(seen[name], expected)
+            self.assertEqual(data["EnvironmentVariables"][name], expected)
+
+        # 在 plist 指定的工作目录与环境中运行真实 doctor，仍须能读取同一凭据。
+        env = self.env()
+        env.update(data["EnvironmentVariables"])
+        checked = subprocess.run(
+            data["ProgramArguments"][:2] + ["doctor"],
+            cwd=data["WorkingDirectory"], env=env,
+            capture_output=True, encoding="utf-8", timeout=30)
+        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+        self.assertEqual(json.loads(checked.stdout)["token_source"], "desktop")
+
+    def test_relative_paths_are_resolved_from_installing_directory(self):
+        self.assert_paths_work_after_directory_change()
+
+    def test_home_relative_paths_are_expanded_for_doctor_and_task(self):
+        self.assert_paths_work_after_directory_change(home_relative=True)
+
     def test_generates_valid_plist_under_path_with_ampersand(self):
         result = self.run_script(INSTALLER)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

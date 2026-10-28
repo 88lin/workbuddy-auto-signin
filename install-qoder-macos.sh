@@ -74,12 +74,27 @@ if [ ! -f "$SCRIPT" ]; then
   exit 1
 fi
 
+# 自检沿用调用者的工作目录，launchd 则在仓库目录运行。
+# 提前展开 ~ 与相对路径，让两边使用完全相同的绝对路径。
+absolute_path() {
+  "$PYTHON" -c 'import os, sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$1"
+}
+if [ -n "${QODER_EXE:-}" ]; then
+  QODER_EXE="$(absolute_path "$QODER_EXE")" || die "无法解析 QODER_EXE"
+  export QODER_EXE
+fi
+if [ -n "${QODER_AUTH_DIR:-}" ]; then
+  QODER_AUTH_DIR="$(absolute_path "$QODER_AUTH_DIR")" || die "无法解析 QODER_AUTH_DIR"
+  export QODER_AUTH_DIR
+fi
+
 # ── 登录态自检：不联网、不领取 ────────────────────────────────
 # 注意：这里用到的 QODER_EXE / QODER_AUTH_DIR 必须一并写进 plist，
 # 否则会出现「自检通过、安装成功，launchd 里却报 NO_AUTH」——
 # launchd 不继承安装时终端的环境变量。
+# QODER_TOKEN 不会保存到 plist，自检必须排除它，实际验证桌面登录态。
 echo "[0/3] 登录态自检（不联网、不领取）"
-if DOCTOR="$("$PYTHON" "$SCRIPT" doctor 2>&1)"; then
+if DOCTOR="$(QODER_TOKEN= "$PYTHON" "$SCRIPT" doctor 2>&1)"; then
   echo "  ✓ $DOCTOR"
 else
   echo "  ✗ 自检失败：$DOCTOR"
@@ -106,10 +121,10 @@ schedule = (10, 11, 15, 19, 23)
 
 # 只透传「非敏感」的配置；访问令牌一律不写入 plist。
 env = {"PYTHONIOENCODING": "utf-8"}
-if os.environ.get("PL_EXE", "").strip():
-    env["QODER_EXE"] = os.environ["PL_EXE"].strip()
-if os.environ.get("PL_AUTHDIR", "").strip():
-    env["QODER_AUTH_DIR"] = os.environ["PL_AUTHDIR"].strip()
+if os.environ.get("PL_EXE"):
+    env["QODER_EXE"] = os.environ["PL_EXE"]
+if os.environ.get("PL_AUTHDIR"):
+    env["QODER_AUTH_DIR"] = os.environ["PL_AUTHDIR"]
 
 plist = {
     "Label": os.environ["PL_LABEL"],

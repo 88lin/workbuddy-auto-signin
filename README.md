@@ -436,6 +436,7 @@ bash install-qoder-macos.sh
 | `qoder-daily-credits` | 每天 10:05，另加 11:05 / 15:05 / 19:05 / 23:05 | 查询并领取，每轮一行 JSON 写入 `~/Library/Logs/QoderDailyCredits/out.log` |
 
 安装脚本会先跑一次 `doctor` 自检（不联网、不领取），通过后才注册；注册失败会用备份自动回滚，不会把已有任务弄丢。
+自检会忽略终端里的临时 `QODER_TOKEN`，确认桌面登录态可用；自定义的 `QODER_EXE` / `QODER_AUTH_DIR` 会按安装时的当前目录展开为绝对路径，用于自检并保存到后台任务。
 
 > [!NOTE]
 > macOS 上首次读取登录态时，系统可能弹出钥匙串授权框（`Qoder CN App Safe Storage`）。选「始终允许」，否则后台任务会卡在等待授权。
