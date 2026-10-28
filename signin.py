@@ -836,7 +836,7 @@ def dig(obj, key):
 
 
 def _api_success(code, body):
-    """补登相关接口同时检查 HTTP 状态和 JSON 业务码。"""
+    """同时检查 HTTP 状态和 JSON 业务码，避免把业务失败当作状态转换成功。"""
     business_code = body.get("code") if isinstance(body, dict) else None
     return 200 <= code < 300 and (
         business_code is None or (type(business_code) is int and business_code == 0))
@@ -1089,7 +1089,7 @@ def _already_report(status, via=None):
 
 
 def run_growth(headers, endpoint):
-    """成长中心自动化：领旅行礼物→派 Buddy→领任务/领取新任务→补登→连登兑换→开盲盒→能量开 Buddy→汇报。
+    """成长中心自动化：领旅行礼物→领任务→补登→连登兑换→开盲盒→能量开 Buddy→派出→汇报。
 
     各子步骤单独 try，一段失败不影响其余领取；认证或权限拒绝时结束本轮。
     """
@@ -1104,6 +1104,13 @@ def run_growth(headers, endpoint):
         """已知业务 403 由调用方先处理，其余认证/权限拒绝结束本轮。"""
         return code in (401, 403)
 
+    def _stop_for_auth(code):
+        # 派出已移到奖励领取之后；即使被拒，也必须保留本轮已到账的奖励。
+        out = _auth_failure(code)
+        out["report"] = "；".join(parts + [out["report"]])
+        out["credits_gained"] = credits_gained
+        return 1, out
+
     def _note_http(code, body, label, required=False):
         """前置查询接口非 2xx 时的统一记录；返回 True 表示调用方应跳过后续处理。
 
@@ -1111,8 +1118,8 @@ def run_growth(headers, endpoint):
         successes=0 且 failures=0 会被判成 idle，轮询既不写日志又返回 0，
         服务端故障彻底无声无息。旅行模块早就这么做了，其余各段没跟上。
 
-        一般查询的 4xx 只进报告、不计失败。补登判断所必需的查询用 required=True：
-        查询失败或业务码非零时必须提醒，不能把未知状态解释为无需补登。
+        一般查询的 4xx 只进报告、不计失败。影响写操作的前置查询用 required=True：
+        查询失败或业务码非零时必须提醒，不能把未知状态解释为可安全操作。
         """
         nonlocal failures, hard_failures
         if 200 <= code < 300 and (not required or _api_success(code, body)):
@@ -1130,7 +1137,10 @@ def run_growth(headers, endpoint):
             hard_failures += 1
         return True
 
-    # --- 1. Buddy 旅行：领礼物 + 派出发 ---
+    # --- 1. Buddy 旅行：先领已有礼物，派出放到能量开 Buddy 之后 ---
+    # 开 Buddy 会覆盖旅行记录；只有明确 idle 才能开，状态未知也不能放行。
+    travel = None
+    daily_limit = False
     try:
         scode, sbody = get(base + "/buddy/travel/status", headers)
         if scode == CODE_BUDGET_OUT:
@@ -1142,57 +1152,38 @@ def run_growth(headers, endpoint):
                        "report": "网络不可达，成长中心跳过（%s）" % (sbody.get("error") or "")}
         if _check_auth(scode):
             return 1, _auth_failure(scode)
-        travel = dig(sbody, "state") if (200 <= scode < 300) else None
-        # 服务端明确给出"今日旅行名额已用完"。读它而不是等 depart 报错，
-        # 轮询场景下差别很大：后者会让每一轮都白撞一次墙。
-        daily_limit = bool(dig(sbody, "daily_limit_reached")) if (200 <= scode < 300) else False
-        _note_http(scode, sbody, "查旅行状态")
-        claimed_travel = False
+        if not _note_http(scode, sbody, "查旅行状态", required=True):
+            state = dig(sbody, "state")
+            if state in ("idle", "traveling", "arrived"):
+                travel = state
+                daily_limit = bool(dig(sbody, "daily_limit_reached"))
+            else:
+                parts.append("旅行状态无法识别，跳过开 Buddy 与派出")
+                failures += 1
+                hard_failures += 1
         if travel == "arrived":
             record_id = dig(sbody, "record_id")
             ccode, cbody = post(base + "/buddy/travel/claim", headers, {"record_id": record_id})
             if _check_auth(ccode):
                 return 1, _auth_failure(ccode)
-            if 200 <= ccode < 300 and dig(cbody, "reward_credit") is not None:
+            if _api_success(ccode, cbody) and dig(cbody, "reward_credit") is not None:
                 got = as_int(dig(cbody, "reward_credit"))
                 credits_gained += got
                 parts.append("领旅行礼物 +%s 积分" % fmt_credit(got))
                 successes += 1
-                claimed_travel = True
+                travel = "idle"  # 确认领取成功后，才允许开 Buddy 或派出。
             else:
                 # 领失败：带出业务 msg，不再说"HTTP 200"；也不派 Buddy 出发，避免覆盖未领取的奖励
                 msg = (dig(cbody, "msg") or "") if isinstance(cbody, dict) else ""
                 parts.append("领旅行礼物失败：%s" % (msg or "HTTP %s" % ccode))
                 failures += 1
                 hard_failures += _is_hard_failure(ccode)
-            if claimed_travel:
-                travel = "idle"  # 只有领取成功后才视为 idle，允许派出发
         if travel == "idle" and daily_limit:
             # 今日名额已用完：直接收手，不碰 config/depart，省掉两个请求和一条必然的失败
             parts.append("今日旅行名额已用完")
-        elif travel == "idle":
-            ccode, cbody = get(base + "/buddy/travel/config", headers)
-            if _check_auth(ccode):
-                return 1, _auth_failure(ccode)
-            locs = dig(cbody, "locations") if (200 <= ccode < 300) else None
-            if locs and isinstance(locs[0], dict):
-                loc = locs[0]
-                dcode, dbody = post(base + "/buddy/travel/depart", headers,
-                                    {"location_id": loc.get("id")})
-                if _check_auth(dcode):
-                    return 1, _auth_failure(dcode)
-                if 200 <= dcode < 300:
-                    loc_name = (dig(dbody, "location") or {}).get("name", "?")
-                    dur = dig(dbody, "duration_hours") or (dig(dbody, "location") or {}).get("duration_hours", "?")
-                    parts.append("派 Buddy 去%s（%s 小时后回）" % (loc_name, dur))
-                    successes += 1
-                else:
-                    msg = dig(dbody, "msg") or ""
-                    parts.append("派 Buddy 失败：%s" % (msg or "HTTP %s" % dcode))
-                    failures += 1
-                    hard_failures += _is_hard_failure(dcode)
         elif travel == "traveling":
-            loc_name = (dig(sbody, "location") or {}).get("name", "?")
+            location = dig(sbody, "location")
+            loc_name = location.get("name", "?") if isinstance(location, dict) else "?"
             # arrive_at / server_now 是服务端时间戳，比本地时钟可靠
             parts.append("Buddy 旅行中（%s%s）" % (
                 loc_name, _fmt_eta(dig(sbody, "arrive_at"), dig(sbody, "server_now"))))
@@ -1455,7 +1446,10 @@ def run_growth(headers, endpoint):
             hard_failures += 1
 
     # --- 6. Buddy 盲盒（能量攒够 cost_per_open 就开；能量没有其它消耗出口）---
-    if _budget_left() <= 0:
+    if travel != "idle":
+        parts.append("Buddy 盲盒跳过：%s" % (
+            "旅行尚未结束或礼物尚未领到" if travel in ("traveling", "arrived") else "旅行状态未知"))
+    elif _budget_left() <= 0:
         parts.append("时间预算耗尽，Buddy 盲盒跳过")
     else:
         try:
@@ -1486,6 +1480,41 @@ def run_growth(headers, endpoint):
             parts.append("Buddy 盲盒模块异常（%s: %s）" % (type(e).__name__, e))
             failures += 1
             hard_failures += 1
+
+    # --- 6b. 最后派出：既不覆盖在途礼物，也让每天只跑一次的用户有机会开 Buddy ---
+    if travel == "idle" and not daily_limit:
+        if _budget_left() <= 0:
+            parts.append("时间预算耗尽，派 Buddy 跳过")
+        else:
+            try:
+                ccode, cbody = get(base + "/buddy/travel/config", headers)
+                if _check_auth(ccode):
+                    return _stop_for_auth(ccode)
+                if not _note_http(ccode, cbody, "查旅行配置", required=True):
+                    locs = dig(cbody, "locations")
+                    if locs and isinstance(locs[0], dict):
+                        dcode, dbody = post(base + "/buddy/travel/depart", headers,
+                                            {"location_id": locs[0].get("id")})
+                        msg = str(dig(dbody, "msg") or "")
+                        if dcode == 403 and msg.strip().lower() == "no active buddy":
+                            parts.append("派 Buddy 跳过：尚未领养 Buddy")
+                        elif _check_auth(dcode):
+                            return _stop_for_auth(dcode)
+                        elif _api_success(dcode, dbody):
+                            location = dig(dbody, "location")
+                            location = location if isinstance(location, dict) else {}
+                            loc_name = location.get("name", "?")
+                            dur = dig(dbody, "duration_hours") or location.get("duration_hours", "?")
+                            parts.append("派 Buddy 去%s（%s 小时后回）" % (loc_name, dur))
+                            successes += 1
+                        else:
+                            parts.append("派 Buddy 失败：%s" % (msg or "HTTP %s" % dcode))
+                            failures += 1
+                            hard_failures += _is_hard_failure(dcode)
+            except Exception as e:
+                parts.append("派 Buddy 模块异常（%s: %s）" % (type(e).__name__, e))
+                failures += 1
+                hard_failures += 1
 
     # --- 7. 能量 & 连签状态（纯展示值，预算不够就直接不取，不计失败）---
     energy = None

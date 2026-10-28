@@ -264,5 +264,211 @@ class MakeupTests(unittest.TestCase):
             self.assertNotIn("synthetic-token", json.dumps(entry))
 
 
+class BuddyLifecycleTests(unittest.TestCase):
+    """模拟旅行跨日与能量变化，所有接口都在内存中执行。"""
+
+    def setUp(self):
+        self.state = "idle"
+        self.daily_limit = False
+        self.energy = 10
+        self.has_buddy = True
+        self.task_pending = False
+        self.status_reply = None
+        self.claim_reply = None
+        self.depart_reply = None
+        self.events = []
+        self.remaining = 120
+        self.exhaust_after_open = False
+        get_patch = patch.object(signin, "get", side_effect=self.get)
+        post_patch = patch.object(signin, "post", side_effect=self.post)
+        get_patch.start()
+        post_patch.start()
+        self.addCleanup(get_patch.stop)
+        self.addCleanup(post_patch.stop)
+
+    def get(self, url, headers):
+        path = url.split("/v2/activity/growth", 1)[1]
+        self.events.append(("GET", path))
+        if path == "/buddy/travel/status":
+            if isinstance(self.status_reply, Exception):
+                raise self.status_reply
+            return copy.deepcopy(self.status_reply) if self.status_reply is not None else response({
+                "state": self.state, "record_id": 7, "daily_limit_reached": self.daily_limit,
+                "location": {"name": "咖啡馆"}, "arrive_at": 0, "server_now": 0})
+        if path == "/buddy/travel/config":
+            return response({"locations": [{"id": 1, "name": "咖啡馆", "duration_hours": 1}]})
+        if path == "/tasks":
+            return response({"tasks": [{"task_code": "first_buddy", "title": "首只 Buddy",
+                                         "accept_status": "completed"}] if self.task_pending else []})
+        if path == "/streak":
+            return response({"streak": {"days": 1}, "makeup_cards": {"balance": 0}})
+        if path == "/redeem/summary":
+            return response({tier + "_status": "locked" for tier in ("starter", "advanced", "legendary")})
+        if path == "/lottery/chances":
+            return response({"balance": 0})
+        if path == "/buddy/quota":
+            return response({"affordable": self.energy // 10, "max_open_count": 1})
+        if path == "/energy":
+            return response({"balance": self.energy})
+        self.fail("Unexpected GET: " + path)
+
+    def post(self, url, headers, payload=None, **kwargs):
+        path = url.split("/v2/activity/growth", 1)[1]
+        self.events.append(("POST", path))
+        if path == "/buddy/travel/claim":
+            if isinstance(self.claim_reply, Exception):
+                raise self.claim_reply
+            if self.claim_reply is not None:
+                return copy.deepcopy(self.claim_reply)
+            self.state = "idle"
+            return response({"reward_credit": 50})
+        if path == "/tasks/first_buddy/claim":
+            self.task_pending = False
+            self.energy += 8
+            return response({"credit": 300, "energy": 8})
+        if path == "/buddy/open":
+            self.energy -= payload["count"] * 10
+            self.has_buddy = True
+            self.state = "idle"
+            if self.exhaust_after_open:
+                self.remaining = 0
+            return response({"buddy": "新 Buddy"})
+        if path == "/buddy/travel/depart":
+            if self.depart_reply is not None:
+                return copy.deepcopy(self.depart_reply)
+            if not self.has_buddy:
+                return 403, {"msg": "no active buddy"}
+            self.state = "traveling"
+            self.daily_limit = True
+            return response({"location": {"name": "咖啡馆"}, "duration_hours": 1})
+        self.fail("Unexpected POST: " + path)
+
+    def run_growth(self):
+        signin._start_budget()
+        return signin.run_growth({}, "https://test.invalid")
+
+    def writes(self):
+        return [path for method, path in self.events if method == "POST"]
+
+    def assert_no_buddy_mutation(self):
+        self.assertNotIn("/buddy/open", self.writes())
+        self.assertNotIn("/buddy/travel/depart", self.writes())
+
+    def test_traveling_keeps_trip_and_still_claims_task_rewards(self):
+        self.state = "traveling"
+        self.task_pending = True
+        code, out = self.run_growth()
+        self.assertEqual((code, out["credits_gained"]), (0, 300))
+        self.assertEqual(self.state, "traveling")
+        self.assert_no_buddy_mutation()
+
+    def test_unclaimed_gift_is_preserved_on_failed_claim(self):
+        self.state = "arrived"
+        for reply in ((500, {"msg": "unavailable"}),
+                      (200, {"code": 10001, "data": {"reward_credit": 0}}),
+                      RuntimeError("synthetic claim failure")):
+            with self.subTest(reply=reply):
+                self.events.clear()
+                self.state = "arrived"
+                self.claim_reply = reply
+                self.run_growth()
+                self.assert_no_buddy_mutation()
+
+    def test_unknown_travel_state_blocks_buddy_writes_but_not_other_rewards(self):
+        replies = [(503, {"msg": "unavailable"}), response({}),
+                   response({"state": "unexpected"}),
+                   (200, {"code": 10001, "data": {"state": "idle"}}),
+                   RuntimeError("synthetic status failure")]
+        for reply in replies:
+            with self.subTest(reply=reply):
+                self.events.clear()
+                self.status_reply = reply
+                self.task_pending = True
+                code, out = self.run_growth()
+                self.assertEqual((code, out["credits_gained"]), (1, 300))
+                self.assertFalse(out["idle"])
+                self.assert_no_buddy_mutation()
+
+    def test_bad_display_metadata_does_not_drop_known_travel_state(self):
+        self.status_reply = response({"state": "traveling", "location": "unexpected"})
+        self.run_growth()
+        self.assert_no_buddy_mutation()
+
+    def test_task_energy_is_used_before_departure_for_first_buddy(self):
+        self.has_buddy = False
+        self.energy = 2
+        self.task_pending = True
+        code, out = self.run_growth()
+        self.assertEqual((code, out["credits_gained"]), (0, 300))
+        self.assertEqual(self.writes(), ["/tasks/first_buddy/claim", "/buddy/open",
+                                         "/buddy/travel/depart"])
+        self.assertEqual(self.state, "traveling")
+
+    def test_daily_only_runs_open_before_each_new_trip(self):
+        self.energy = 40
+        for day in range(4):
+            with self.subTest(day=day):
+                if day:
+                    self.assertEqual(self.state, "traveling")
+                    self.state = "arrived"
+                    self.daily_limit = False
+                self.events.clear()
+                code, _ = self.run_growth()
+                self.assertEqual(code, 0)
+                expected = (["/buddy/travel/claim"] if day else []) + [
+                    "/buddy/open", "/buddy/travel/depart"]
+                self.assertEqual(self.writes(), expected)
+                self.assertEqual(self.state, "traveling")
+        self.assertEqual(self.energy, 0)
+
+    def test_used_daily_quota_still_allows_opening(self):
+        self.daily_limit = True
+        code, _ = self.run_growth()
+        self.assertEqual((code, self.writes()), (0, ["/buddy/open"]))
+        self.assertNotIn(("GET", "/buddy/travel/config"), self.events)
+
+    def test_insufficient_energy_does_not_block_departure(self):
+        self.energy = 0
+        code, _ = self.run_growth()
+        self.assertEqual((code, self.writes()), (0, ["/buddy/travel/depart"]))
+
+    def test_only_known_no_buddy_403_is_a_benign_skip(self):
+        self.energy = 0
+        for msg in ("no active buddy", " No Active Buddy "):
+            with self.subTest(msg=msg):
+                self.events.clear()
+                self.depart_reply = 403, {"msg": msg}
+                code, out = self.run_growth()
+                self.assertEqual(code, 0)
+                self.assertTrue(out["idle"])
+                self.assertNotIn("failures", out)
+                self.assertIn("派 Buddy 跳过", out["report"])
+
+    def test_unknown_auth_rejections_remain_visible_and_keep_earned_credits(self):
+        cases = [(403, {}), (403, {"msg": "Forbidden"}),
+                 (403, {"msg": "Forbidden "}), (403, {"msg": "permission denied"}),
+                 (401, {"msg": "no active buddy"})]
+        self.energy = 0
+        for reply in cases:
+            with self.subTest(reply=reply):
+                self.events.clear()
+                self.task_pending = True
+                self.depart_reply = reply
+                code, out = self.run_growth()
+                self.assertEqual(code, 1)
+                self.assertEqual(out["http"], reply[0])
+                self.assertTrue(out["needs_attention"])
+                self.assertEqual(out["credits_gained"], 300)
+                self.assertIn("首只 Buddy", out["report"])
+                self.assertEqual(self.events[-1], ("POST", "/buddy/travel/depart"))
+
+    def test_budget_exhausted_after_opening_prevents_departure(self):
+        self.exhaust_after_open = True
+        with patch.object(signin, "_budget_left", side_effect=lambda: self.remaining):
+            _, out = self.run_growth()
+        self.assertEqual(self.writes(), ["/buddy/open"])
+        self.assertIn("派 Buddy 跳过", out["report"])
+
+
 if __name__ == "__main__":
     unittest.main()
