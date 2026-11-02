@@ -714,9 +714,15 @@ class Api:
 
     def _raw(self, path, method):
         url = self.base_url + path
+        headers = {**BASE_HEADERS, **self.risk, "Authorization": "Bearer %s" % self.token}
+        hostname = headers.get("Cosy-MachineHostname")
+        if isinstance(hostname, str):
+            # http.client 把 str 头值按 Latin-1 编码；直接传 UTF-8 bytes，
+            # 保留中文及重音字符，只在发送时转换，不改写设备标识缓存。
+            headers["Cosy-MachineHostname"] = hostname.encode("utf-8")
         request = urllib.request.Request(
             url, method=method,
-            headers={**BASE_HEADERS, **self.risk, "Authorization": "Bearer %s" % self.token},
+            headers=headers,
             data=b"" if method == "POST" else None,
         )
         try:
