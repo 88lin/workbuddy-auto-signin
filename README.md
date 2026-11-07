@@ -40,24 +40,6 @@
 </td>
 <td valign="middle"><b><a href="https://www.sheapi.top/sign-up?aff=MvcR">SheApi</a></b>&nbsp;是一家可靠高效的 API 中转服务提供商，主要提供 GPT-6 Astra、kimi-k3、grok-4.7、glm-5.3、deepseek-v4.1-flash 等主流模型的高稳定中转能力，Codex 倍率补贴低至 0.06，GPT-Image-2生图每张0.04。受邀注册送$1 体验金，每日签到还可领取专属免费额度。</td>
 </tr>
-<tr>
-<td width="180" align="center" valign="middle">
-  <a href="https://anyrouter.top/register?aff=woX5"><img src="https://raw.githubusercontent.com/88lin/picx-images-hosting/master/%E5%BE%AE%E4%BF%A1%E5%9B%BE%E7%89%87_20260907170036_114_2.webp" alt="Any Router" width="150"></a>
-</td>
-<td valign="middle"><b><a href="https://anyrouter.top/register?aff=woX5">Any Router</a></b>&nbsp;是免费公益大模型API平台，可用GPT-6-Astra、claude-opus-5.5等顶级模型。被邀得＄50，每日签到随机额度。</td>
-</tr>
-<tr>
-<td width="180" align="center" valign="middle">
-  <a href="https://www.workbuddy.cn/events/invite?inviteCode=1qbwl6bilsn"><img src="https://raw.githubusercontent.com/88lin/picx-images-hosting/master/workbuddy-logo.png" alt="WorkBuddy" width="150"></a>
-</td>
-<td valign="middle"><b><a href="https://www.workbuddy.cn/events/invite?inviteCode=1qbwl6bilsn">WorkBuddy</a></b>&nbsp;是腾讯出品的全能 AI 工作台，是中国最受欢迎的效率 AI 智能体服务，说出要求、开始执行任务、交付完整成果。其中Hy4模型限时免费使用，注册即可获取2000积分，每月再赠送500积分，可用Kimi-K3、GLM-5.3、Deepseek-V4.1-Flash等模型。</td>
-</tr>
-<tr>
-<td width="180" align="center" valign="middle">
-  <a href="https://lightvela.ai/?ref=CC9FGXAT9W"><img src="https://raw.githubusercontent.com/88lin/picx-images-hosting/master/lightvela-logo.svg" alt="LightVela" width="150"></a>
-</td>
-<td valign="middle"><b><a href="https://lightvela.ai/?ref=CC9FGXAT9W">LightVela</a></b>&nbsp;是腾讯轻量云团队推出的云端 Agent 托管产品，它把 Agent 的部署、运维与 7×24 小时运行全部放在云端托管，支持跨会话记忆、连接主流聊天通道（微信、QQ、飞书、钉钉等），可自定义模型、工具、人设。新用户免费体验1个月，送 2核8G 云主机 + 4500 AI 积分。</td>
-</tr>
 </table>
 
 ## ✨ 特性
