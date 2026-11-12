@@ -849,13 +849,22 @@ def _registry_lock(timeout=REGISTRY_LOCK_TIMEOUT):
 
 
 def _snapshot_state(entry):
-    """返回 (path, usable)：文件存在且凭据未过期才算可用。"""
+    """返回 (path, usable)：文件存在、凭据结构/令牌格式合法且未过期才算可用。
+
+    选择阶段只做本地格式检查（_validate_session + _token_format），不解密、不联网：
+    受支持的加密信封仍然算可用。能解析 JSON 但缺少 auth/account、令牌格式非法，
+    或快照里的 UID 与清单记录对不上，都不能算"可用"。
+    """
     path = credential_path(entry)
     if not os.path.exists(path):
         return path, False
     try:
         session = load_session(path)
-    except (OSError, ValueError, UnicodeError):
+        _validate_session(session)
+        _token_format(session["auth"]["accessToken"])
+    except (OSError, ValueError, UnicodeError, AuthError):
+        return path, False
+    if entry.get("uid") and session["account"].get("uid") != entry["uid"]:
         return path, False
     return path, _session_expired(session) is None
 
@@ -969,6 +978,19 @@ def order_accounts(registry):
         return (stamp, 0 if (not stamp and account["name"] == active) else 1, account["name"])
 
     return sorted(registry["accounts"], key=sort_key)
+
+
+def _identity_sort_key(group, active):
+    """一个登录身份（同 uid 的多份快照）的轮转排序键。
+
+    取组内所有快照 last_run_at 的最大值：只要这个身份跑过（不管这一轮实际执行的是
+    哪一份快照），它就不该继续靠"过期别名的空时间"排在最前面。只有整个身份从未运行
+    过时，才让当前账号优先。这样既兼容既有清单里的历史记录，也不需要把没执行的
+    过期别名标成成功。
+    """
+    last = max((account.get("last_run_at") or "" for account in group), default="")
+    is_active = any(account["name"] == active for account in group)
+    return (last, 0 if (not last and is_active) else 1)
 
 
 def _expires_text(value):
@@ -1214,15 +1236,26 @@ def credential_plan(explicit=None, rotate=True):
         active = registry.get("active")
         entries = [a for a in entries if a["name"] == active][:1] or entries[:1]
 
-    # 按 uid 分组，但先给每个身份挑一份可用快照，再去重：否则「过期/丢失的同 uid 快照」
-    # 排在前面时，后面那份有效快照会被当成重复身份跳过，整轮只剩一个 EXPIRED。
+    # 按 uid 分组，但先给每个身份挑一份可用快照，再去重：否则「过期/丢失/损坏的同 uid
+    # 快照」排在前面时，后面那份有效快照会被当成重复身份跳过，整轮只剩一个错误。
     groups = {}
     for entry in entries:
         key = entry["uid"] or ("#name#%s" % entry["name"])
         groups.setdefault(key, []).append(entry)
 
+    # 轮转顺序按「登录身份」排，不按别名排：同 uid 的旧别名可能永远没有运行时间，
+    # 不能让它把整个身份一直按在第一位，否则短预算下其它身份会被一直饿死。
+    ordered_groups = list(groups.values())
+    if rotate:
+        active = registry.get("active")
+        # 相同时间的并列用清单顺序兜底，而不是字母序：否则同一秒里跑完的身份会被
+        # 名字顺序重新排一遍，短预算下仍可能让某个身份一直排后面。
+        ordered_groups = [group for _, group in sorted(
+            enumerate(ordered_groups),
+            key=lambda item: _identity_sort_key(item[1], active) + (item[0],))]
+
     contexts = []
-    for group in groups.values():
+    for group in ordered_groups:
         chosen = None
         fallback = None
         for entry in group:

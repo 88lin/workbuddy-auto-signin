@@ -3,6 +3,7 @@
 这些用例只操作临时目录里的假凭据，不联网、不碰真实客户端数据。
 """
 
+import base64
 import io
 import json
 import os
@@ -35,6 +36,16 @@ def credential(uid=UID_A, token="token-a",
 def account_token(headers):
     """从请求头反查是哪个账号：测试凭据用不同的明文令牌。"""
     return headers["Authorization"].rsplit(" ", 1)[-1]
+
+
+def envelope_token():
+    """构造一份本地格式合法的 sym-v1 加密信封（不涉及真实密钥）。"""
+    envelope = {"suite": 1, "keyId": "0123456789abcdef",
+                "nonce": base64.b64encode(b"\x00" * 12).decode(),
+                "authTag": base64.b64encode(b"\x01" * 16).decode(),
+                "ciphertext": base64.b64encode(b"payload").decode()}
+    return {"$wbEncrypted": 1,
+            "envelope": base64.b64encode(json.dumps(envelope).encode()).decode()}
 
 
 class AccountTestCase(unittest.TestCase):
@@ -489,6 +500,71 @@ class SnapshotSelectionTests(AccountTestCase):
         daily.assert_not_called()
         self.assertEqual(emitted[-1]["result"], "EXPIRED")
 
+    def test_parsable_but_invalid_snapshot_is_not_usable(self):
+        self.bind("old", credential(uid=UID_A, token="token-old"))
+        old_path = Path(signin.credential_path(signin.find_account("old")))
+        self.bind("fresh", credential(uid=UID_A, token="token-fresh"), force=True)
+        old_path.write_text("{}", encoding="utf-8")
+        signin.use_account("old")
+
+        seen = []
+
+        def daily(headers, endpoint):
+            seen.append(account_token(headers))
+            return 0, {"result": "ALREADY", "report": "ok"}, True
+
+        with patch.object(signin, "run_daily", side_effect=daily), patch.object(signin, "emit"):
+            self.assertEqual(signin._run("auto"), 0)
+        self.assertEqual(seen, ["token-fresh"])
+
+    def test_invalid_token_format_snapshot_is_not_usable(self):
+        self.bind("old", credential(uid=UID_A, token="token-old"))
+        old_path = Path(signin.credential_path(signin.find_account("old")))
+        self.bind("fresh", credential(uid=UID_A, token="token-fresh"), force=True)
+        old_path.write_text(json.dumps(credential(uid=UID_A, token="bad token")),
+                            encoding="utf-8")
+        contexts, _ = signin.credential_plan()
+        self.assertEqual([c[0] for c in contexts], ["fresh"])
+
+    def test_encrypted_envelope_snapshot_counts_as_usable(self):
+        self.bind("old", credential(uid=UID_A, token="token-old"))
+        old_path = Path(signin.credential_path(signin.find_account("old")))
+        self.bind("fresh", credential(uid=UID_A, token=envelope_token()), force=True)
+        old_path.write_text("{}", encoding="utf-8")
+        contexts, _ = signin.credential_plan()
+        self.assertEqual([c[0] for c in contexts], ["fresh"])
+        self.assertTrue(contexts[0][1], "加密信封本地格式合法，应被选中（无需解密）")
+
+    def test_uid_mismatch_snapshot_is_not_usable(self):
+        self.accounts_root.mkdir(parents=True, exist_ok=True)
+        (self.accounts_root / "a.info").write_text(
+            json.dumps(credential(uid=UID_B, token="token-b")), encoding="utf-8")
+        (self.accounts_root / "b.info").write_text(
+            json.dumps(credential(uid=UID_A, token="token-a")), encoding="utf-8")
+        base = {"endpoint": "https://example.com", "bound_at": "",
+                "last_run_at": "", "last_result": "", "last_code": 0}
+        signin.save_registry({"version": 1, "active": "a", "accounts": [
+            dict(base, name="a", uid=UID_A, credential="a.info"),
+            dict(base, name="b", uid=UID_A, credential="b.info")]})
+        contexts, _ = signin.credential_plan()
+        self.assertEqual([c[0] for c in contexts], ["b"])
+
+    def test_all_parsable_but_invalid_snapshots_still_report_error(self):
+        self.bind("old", credential(uid=UID_A, token="token-old"))
+        old_path = Path(signin.credential_path(signin.find_account("old")))
+        self.bind("fresh", credential(uid=UID_A, token="token-fresh"), force=True)
+        fresh_path = Path(signin.credential_path(signin.find_account("fresh")))
+        old_path.write_text("{}", encoding="utf-8")
+        fresh_path.write_text("{}", encoding="utf-8")
+        signin.use_account("old")
+
+        emitted = []
+        with patch.object(signin, "run_daily") as daily, \
+                patch.object(signin, "emit", side_effect=lambda out, step: emitted.append(out)):
+            self.assertEqual(signin._run("auto"), 1)
+        daily.assert_not_called()
+        self.assertIn(emitted[-1]["result"], ("NO_SESSION", "AUTH_ERROR"))
+
 
 class RegistryLockTests(AccountTestCase):
     def test_lock_is_exclusive_across_threads(self):
@@ -567,6 +643,47 @@ class FairnessTests(AccountTestCase):
                 with patch.object(signin, "_budget_left", side_effect=[60.0, 10.0]):
                     self.assertEqual(signin._run("auto"), 0)
                 self.assertEqual(self.calls, expected)
+
+
+class IdentityFairnessTests(AccountTestCase):
+    """同一 UID 的旧别名不能把整个身份永久钉在轮转第一位。"""
+
+    def setUp(self):
+        super().setUp()
+        past = (time.time() - 3600) * 1000
+        self.bind("old", credential(uid=UID_A, token="token-old", expires_at=past))
+        self.bind("fresh", credential(uid=UID_A, token="token-fresh"), force=True)
+        self.bind("b", credential(uid=UID_B, token="token-b"))
+        signin.use_account("old")
+        self.calls = []
+
+    def fake_daily(self):
+        def run(headers, endpoint):
+            self.calls.append(account_token(headers))
+            return 0, {"result": "CLAIMED", "report": "ok"}, True
+        return run
+
+    def test_expired_alias_cannot_pin_identity_to_first_place(self):
+        with patch.object(signin, "run_daily", side_effect=self.fake_daily()), \
+                patch.object(signin, "emit"):
+            # 每轮都只够跑一个身份：有效快照跑过之后，独立账号 b 必须轮得到
+            for expected in (["token-fresh"], ["token-b"], ["token-fresh"]):
+                self.calls.clear()
+                with patch.object(signin, "_budget_left", side_effect=[60.0, 10.0]):
+                    self.assertEqual(signin._run("auto"), 0)
+                self.assertEqual(self.calls, expected)
+
+    def test_identity_order_uses_latest_alias_run_time(self):
+        registry = signin.load_registry()
+        by_name = {a["name"]: a for a in registry["accounts"]}
+        # 旧清单状态：有效别名有运行时间，过期别名仍为空
+        by_name["fresh"]["last_run_at"] = "2026-11-12T10:00:00+08:00"
+        by_name["old"]["last_run_at"] = ""
+        by_name["b"]["last_run_at"] = "2026-11-12T09:00:00+08:00"
+        signin.save_registry(registry)
+
+        contexts, _ = signin.credential_plan()
+        self.assertEqual([c[0] for c in contexts], ["b", "fresh"])
 
 
 class CreditAggregationTests(AccountTestCase):
