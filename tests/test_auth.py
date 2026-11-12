@@ -42,6 +42,8 @@ class AuthTests(unittest.TestCase):
         self.environment = patch.dict(os.environ, {
             "WORKBUDDY_AUTH_FILE": str(self.auth_file),
             "WORKBUDDY_SIGNIN_LOG": str(Path(self.temp.name) / "signin.log"),
+            # 隔离账号清单：否则本机绑过账号时，_run 会轮转真实账号，测试变成联网跑。
+            "WORKBUDDY_ACCOUNTS_DIR": str(Path(self.temp.name) / "accounts"),
         })
         self.environment.start()
         self.addCleanup(self.environment.stop)

@@ -7,3 +7,5 @@ __pycache__/
 .workbuddy/
 signin.log
 qoder_signin.log
+# 多账号凭据快照：本机登录凭据副本，绝不能提交
+accounts/

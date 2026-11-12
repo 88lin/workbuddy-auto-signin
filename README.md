@@ -52,6 +52,7 @@
 | 🐱 | **成长中心** —— 自动领旅行礼物、派 Buddy、领取新任务、领任务奖、断登自动补登、连登奖励兑换、开盲盒抽奖、能量开 Buddy 盲盒 |
 | 🐾 | **成长中心轮询** —— 定时方案自带（Win 一键安装 / macOS 模板）：Buddy 一回来就领礼物并补派，把每日名额用满，不让礼物压到第二天 |
 | ⏰ | **双定时模式** —— AI 自动化（跨平台）或系统级静默（Win / macOS，零 token） |
+| 👥 | **多账号** —— 绑定多个账号后，一个账号跑完自动切下一个；任一账号失败不影响其余账号 |
 | 📣 | **智能汇报** —— 一行 JSON，如 `成功领取 100 积分（连续 7 天，累计 700 积分）` |
 | 💪 | **健壮** —— 兼容明文与受支持的加密凭据，区分格式错误、认证拒绝、权限限制及非签到季 |
 | 🌍 | **跨平台** —— 自动探测 Windows / macOS / Linux 凭据文件 |
@@ -274,9 +275,89 @@ python signin.py status         # 仅查签到状态（调试）
 python signin.py doctor         # 离线检查凭据格式及运行时能力，不解密、不联网
 python signin.py claim          # 仅领取签到（调试，幂等）
 python signin.py all            # 查签到状态 + 领取（调试）
+
+# 多账号（详见下面「多账号」一节）
+python signin.py bind <账号名>              # 把客户端当前登录的账号绑定为这个名字
+python signin.py accounts                   # 查看已绑定账号
+python signin.py use <账号名>               # 切换当前账号（轮转时排最前）
+python signin.py unbind <账号名>            # 解绑并删除该账号的凭据副本
+python signin.py auto --account <账号名>    # 只跑指定账号
+python signin.py auto --account current     # 只跑客户端当前登录账号，忽略已绑定账号
 ```
 
 </details>
+
+---
+
+## 👥 多账号
+
+> [!NOTE]
+> WorkBuddy 桌面端同一时刻只保存一个账号的登录状态，切换账号要重新登录。所以「多账号」由脚本自己实现：`bind` 把当时的登录凭据**原样复制**一份存到脚本目录的 `accounts/` 下，之后每次运行按这份快照去请求，不需要在客户端里来回切登录。快照里的令牌仍是客户端加密信封，明文从不落盘。
+
+### 绑定账号
+
+每登录一个账号，绑定一次：
+
+```bash
+# 1. 在桌面端登录账号 A
+python signin.py bind work
+
+# 2. 在桌面端退出登录、换成账号 B 登录
+python signin.py bind home
+
+# 3. 确认结果（uid 只显示前 8 位，方便区分即可）
+python signin.py accounts
+```
+
+输出类似：
+
+```
+已绑定 2 个账号：work（当前），home
+```
+
+`bind` 的规则：
+
+| 场景 | 行为 |
+|---|---|
+| 账号名重复 | 拒绝，加 `--force` 才覆盖（重新登录后更新凭据就用它） |
+| 同一个登录身份绑成两个名字 | 拒绝，加 `--force` 才能重复绑定（轮转时同 uid 只跑一次，不浪费预算） |
+| 账号名 | 中英文、数字、`.`、`_`、`-`，1–32 字符，不能以符号开头（会用作文件名） |
+| 凭据不合法（不是 JSON / 没有 accessToken / 没有 uid） | 直接拒绝，不写入半份快照 |
+| 想绑定已保存的凭据文件 | `python signin.py bind <名字> --from <凭据文件>` |
+
+### 切换与轮转
+
+绑定之后**不需要改定时任务**：`auto` / `silent` / `growth` / `silent-poll` / `silent-growth` 会自动按顺序跑完全部账号，一个账号结束再切下一个。
+
+- **顺序**：`use` 指定的当前账号排最前，其余按「上次运行时间」从早到晚——某次时间不够只跑了一部分时，下一轮会先补上没跑到的账号。
+- **互不影响**：某个账号凭据过期、被服务端拒绝、甚至脚本内部异常，都只记在该账号名下，其余账号照常继续。整轮退出码在**任一账号失败**时为非 0，方便计划任务提醒。
+- **时间预算**：整轮共用一个预算（签到类命令默认 420 秒、轮询默认 180 秒，可用 `WORKBUDDY_BUDGET_SECONDS` 调大，上限见「配置」），按「剩余时间 ÷ 剩余账号数」分给每个账号。剩余时间不够再开一个账号时，其余账号记 `DEFERRED` 留到下一轮，**不算失败**，也不会把任务跑到被系统强杀。
+- **只跑一个**：`--account <名字>`；`--account current` 表示用客户端当前登录的凭据（忽略账号清单）。
+
+`silent` / `silent-poll` 的轮询去重不变：所有账号都「已签且成长中心无可领项」时仍然不写日志。
+
+### 凭据过期与重新绑定
+
+快照里的令牌和客户端登录时一样有有效期（通常接近一年）。凭据过期、或客户端重新登录后快照失效时，脚本会直接返回 `EXPIRED` / `AUTH_REJECTED`，并提示是哪个账号需要重新绑定：
+
+```bash
+# 在桌面端重新登录那个账号，然后
+python signin.py bind <名字> --force
+```
+
+> [!IMPORTANT]
+> `accounts/` 里的文件是本机登录凭据副本，**不要提交到 git、不要同步到网盘或分享**。脚本从不打印令牌；`accounts` 命令也只显示 uid 前 8 位。需要换位置时用 `WORKBUDDY_ACCOUNTS_DIR` 指定（例如加密盘）。
+
+### 多账号命令一览
+
+| 命令 | 作用 |
+|---|---|
+| `python signin.py accounts` | 列出已绑定账号、当前账号、凭据文件是否存在、过期时间、最近一次结果 |
+| `python signin.py bind <名字> [--from <文件>] [--force]` | 绑定 / 更新账号 |
+| `python signin.py use <名字>` | 切换当前账号（轮转时排最前） |
+| `python signin.py unbind <名字>` | 解绑，并删除该账号的凭据副本 |
+| `python signin.py <命令> --account <名字>` | 只跑指定账号 |
+| `python signin.py <命令> --account current` | 只跑客户端当前登录账号 |
 
 ---
 
@@ -317,6 +398,7 @@ Windows 按 `WORKBUDDY_EXE → 默认安装目录 → 注册表` 的顺序发现
 | 环境变量 | 作用 |
 |---|---|
 | `WORKBUDDY_AUTH_FILE` | 自动探测失败时，手动指定凭据文件路径 |
+| `WORKBUDDY_ACCOUNTS_DIR` | 多账号清单与凭据副本的存放目录（默认脚本同目录的 `accounts/`）。目录里是本机登录凭据副本，建议放在只允许自己访问的位置 |
 | `WORKBUDDY_EXE` | 指定与加密凭据对应的客户端**可执行文件**；Windows 为 `WorkBuddy.exe`，macOS 为 `.app/Contents/MacOS/` 内实际可执行文件。路径错误时直接报告，不静默回退 |
 | `WORKBUDDY_SIGNIN_LOG` | `silent` 模式下日志文件路径（默认 `signin.log`） |
 | `WORKBUDDY_BUDGET_SECONDS` | 单次运行的网络请求时间预算。签到类命令默认 `420`（7 分钟）、上限 `540`；`silent-poll` / `silent-growth` 轮询默认 `180`、上限 `240`。**Windows 上须为正数且小于对应计划任务的 `ExecutionTimeLimit`**（macOS launchd 无此限制）。非法值、`≤0` 或超上限都会夹到安全值，并在输出里附 `config_warning` |
@@ -358,6 +440,9 @@ Windows 按 `WORKBUDDY_EXE → 默认安装目录 → 注册表` 的顺序发现
 | `signin.log` 里查不到轮询记录 | 正常——空跑（已签过 / Buddy 还在路上 / 今日名额已用完）默认不落盘。想逐轮查看就设 `WORKBUDDY_GROWTH_LOG_EMPTY=1` |
 | 轮询任务一直显示「今日旅行名额已用完」 | 服务端每日只放行一次派出，当天已派过就会这样，属正常。第二天自动恢复 |
 | 调试原始返回 | `python signin.py status` 或 `python signin.py all` |
+| `EXPIRED` / 多账号里某个账号 `AUTH_REJECTED` | 该账号的凭据快照已过期或被服务端拒绝：重新登录它，再 `python signin.py bind <名字> --force` |
+| `DEFERRED` / 多账号提示留到下一轮 | 时间预算不够再跑一个账号，属正常保护；账号数多时调大 `WORKBUDDY_BUDGET_SECONDS`（须小于计划任务时限） |
+| `MISSING` / 凭据副本丢失 | `accounts/` 里的快照被删了：重新登录该账号后 `python signin.py bind <名字> --force` |
 
 > [!IMPORTANT]
 > 需要处理的结果会附 `needs_attention: true`；静默模式也会记录认证错误。成长中心部分步骤成功不会掩盖其他步骤的硬失败，失败原因会同时进入 `report`。`status` / `claim` / `all` 请求失败返回非零退出码，`all` 的状态查询失败时不会继续领取。
