@@ -279,7 +279,7 @@ python signin.py all            # 查签到状态 + 领取（调试）
 # 多账号（详见下面「多账号」一节）
 python signin.py bind <账号名>              # 把客户端当前登录的账号绑定为这个名字
 python signin.py accounts                   # 查看已绑定账号
-python signin.py use <账号名>               # 切换当前账号（轮转时排最前）
+python signin.py use <账号名>               # 切换当前账号（单账号命令默认用它）
 python signin.py unbind <账号名>            # 解绑并删除该账号的凭据副本
 python signin.py auto --account <账号名>    # 只跑指定账号
 python signin.py auto --account current     # 只跑客户端当前登录账号，忽略已绑定账号
@@ -321,7 +321,8 @@ python signin.py accounts
 |---|---|
 | 账号名重复 | 拒绝，加 `--force` 才覆盖（重新登录后更新凭据就用它） |
 | 同一个登录身份绑成两个名字 | 拒绝，加 `--force` 才能重复绑定（轮转时同 uid 只跑一次，不浪费预算） |
-| 账号名 | 中英文、数字、`.`、`_`、`-`，1–32 字符，不能以符号开头（会用作文件名） |
+| 账号名 | 中英文、数字、`.`、`_`、`-`，1–32 字符，不能以符号开头；`current` / `client` 是保留名（`--account` 选择器已占用） |
+| 与已有账号只差大小写 | 拒绝，加 `--force` 才能同时保留（Windows 文件名不区分大小写，容易混淆） |
 | 凭据不合法（不是 JSON / 没有 accessToken / 没有 uid） | 直接拒绝，不写入半份快照 |
 | 想绑定已保存的凭据文件 | `python signin.py bind <名字> --from <凭据文件>` |
 
@@ -329,10 +330,11 @@ python signin.py accounts
 
 绑定之后**不需要改定时任务**：`auto` / `silent` / `growth` / `silent-poll` / `silent-growth` 会自动按顺序跑完全部账号，一个账号结束再切下一个。
 
-- **顺序**：`use` 指定的当前账号排最前，其余按「上次运行时间」从早到晚——某次时间不够只跑了一部分时，下一轮会先补上没跑到的账号。
+- **顺序**：按「上次运行时间」从早到晚，没跑过的账号优先（其中当前账号排最前）。被 `DEFERRED` 的账号这一轮没有更新时间，下一轮自然排到前面，所以连续几轮预算不足也不会永远只跑同一个账号。
 - **互不影响**：某个账号凭据过期、被服务端拒绝、甚至脚本内部异常，都只记在该账号名下，其余账号照常继续。整轮退出码在**任一账号失败**时为非 0，方便计划任务提醒。
 - **时间预算**：整轮共用一个预算（签到类命令默认 420 秒、轮询默认 180 秒，可用 `WORKBUDDY_BUDGET_SECONDS` 调大，上限见「配置」），按「剩余时间 ÷ 剩余账号数」分给每个账号。剩余时间不够再开一个账号时，其余账号记 `DEFERRED` 留到下一轮，**不算失败**，也不会把任务跑到被系统强杀。
 - **只跑一个**：`--account <名字>`；`--account current` 表示用客户端当前登录的凭据（忽略账号清单）。
+- **积分汇总**：多账号输出顶层的 `credits_gained` 是**本次新领到**的积分合计（签到实发 + 成长中心实发）；`ALREADY` 里的历史积分不计入，避免每天重复累加。
 
 `silent` / `silent-poll` 的轮询去重不变：所有账号都「已签且成长中心无可领项」时仍然不写日志。
 
@@ -354,7 +356,7 @@ python signin.py bind <名字> --force
 |---|---|
 | `python signin.py accounts` | 列出已绑定账号、当前账号、凭据文件是否存在、过期时间、最近一次结果 |
 | `python signin.py bind <名字> [--from <文件>] [--force]` | 绑定 / 更新账号 |
-| `python signin.py use <名字>` | 切换当前账号（轮转时排最前） |
+| `python signin.py use <名字>` | 切换当前账号（单账号命令默认用它；首次轮转时排最前） |
 | `python signin.py unbind <名字>` | 解绑，并删除该账号的凭据副本 |
 | `python signin.py <命令> --account <名字>` | 只跑指定账号 |
 | `python signin.py <命令> --account current` | 只跑客户端当前登录账号 |

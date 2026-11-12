@@ -35,7 +35,7 @@ WORKBUDDY_AUTH_FILE 指定。任何模式下都不会打印令牌，可安全分
 多账号（一个账号跑完自动切下一个）：
   python signin.py bind work      # 把客户端当前登录的账号绑定为 work（登录另一个账号后可再 bind 一个）
   python signin.py accounts       # 查看已绑定账号、当前账号与各自最近一次结果
-  python signin.py use work       # 切换当前账号（轮转时排在最前）
+  python signin.py use work       # 切换当前账号（单账号命令默认用它）
   python signin.py unbind work    # 解绑（同时删除该账号的凭据副本）
   python signin.py auto --account work      # 只跑 work
   python signin.py auto --account current   # 只跑客户端当前登录账号（忽略账号清单）
@@ -47,6 +47,7 @@ WORKBUDDY_AUTH_FILE 指定。任何模式下都不会打印令牌，可安全分
 """
 
 import base64
+import hashlib
 import json
 import math
 import ntpath
@@ -63,7 +64,7 @@ import urllib.error
 import urllib.request
 import urllib.parse
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import date, datetime
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
@@ -118,8 +119,13 @@ ACCOUNTS_VERSION = 1
 # 账号名会用于生成凭据副本文件名，只放行"中英文/数字/点/下划线/短横线"，且首字符不能是
 # 符号：这样 "."、".."、"-x"（会被当成命令行参数）这类名字在入口就被挡掉。
 ACCOUNT_NAME_RE = re.compile(r"[0-9A-Za-z\u4e00-\u9fff][0-9A-Za-z\u4e00-\u9fff._-]{0,31}")
+# 这些名字与 --account 的选择器语义冲突（current/client = 客户端当前登录），不允许绑定。
+RESERVED_ACCOUNT_NAMES = ("current", "client")
 # 剩余预算不足以再跑完一个账号时，宁可把它留给下一轮，也不要跑到一半被任务时限强杀。
 ACCOUNT_MIN_SLICE = 30.0
+# 清单读改写由跨进程锁保护；等锁超时说明另一个实例卡住了，直接报错而不是无限等待。
+REGISTRY_LOCK_TIMEOUT = 15.0
+REGISTRY_LOCK_NAME = ".registry.lock"
 
 AUTH_HELPER_TIMEOUT = 10.0
 AUTH_INPUT_LIMIT = 65536
@@ -778,6 +784,82 @@ def _atomic_write(path, data, mode=0o600):
         raise
 
 
+def _credential_filename(name):
+    """凭据快照文件名只由账号名的哈希决定，与显示名称解耦。
+
+    Windows 文件名不区分大小写：直接拿账号名当文件名，"work" 和 "Work" 会共用同一份
+    快照（后绑的覆盖先绑的），解绑其中一个还会删掉另一个的文件。用大小写敏感的哈希
+    命名后，不同名字必然落到不同文件。
+    """
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:20]
+    return "acct-%s.info" % digest
+
+
+def _acquire_registry_lock(handle, timeout):
+    """尝试获取清单锁；拿不到就短睡重试，超时抛 AccountsError。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise AccountsError("ERROR", "账号清单正被另一个进程占用，请稍后重试")
+            time.sleep(0.05)
+
+
+def _release_registry_lock(handle):
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _registry_lock(timeout=REGISTRY_LOCK_TIMEOUT):
+    """保护清单的完整读改写；os.replace 只保证单次替换完整，挡不住并发丢更新。
+
+    账号管理命令与定时任务可能同时运行：_record_account_run 若读到旧清单后再写回，
+    期间完成的 unbind 会被复活（条目还在、快照已删）。所以所有 load→修改→save 都
+    必须在同一把跨进程锁里完成。
+    """
+    directory = accounts_dir()
+    os.makedirs(directory, exist_ok=True)
+    handle = open(os.path.join(directory, REGISTRY_LOCK_NAME), "a+b")
+    try:
+        _acquire_registry_lock(handle, timeout)
+        try:
+            yield
+        finally:
+            _release_registry_lock(handle)
+    finally:
+        handle.close()
+
+
+def _snapshot_state(entry):
+    """返回 (path, usable)：文件存在且凭据未过期才算可用。"""
+    path = credential_path(entry)
+    if not os.path.exists(path):
+        return path, False
+    try:
+        session = load_session(path)
+    except (OSError, ValueError, UnicodeError):
+        return path, False
+    return path, _session_expired(session) is None
+
+
 def _account_entry(item):
     """校验清单里的单条记录；任何结构问题都当作清单损坏，绝不猜。"""
     if not isinstance(item, dict):
@@ -825,6 +907,10 @@ def _registry_from(data):
         names.add(entry["name"])
         entries.append(entry)
     active = data.get("active")
+    # active 必须是账号名或 null：数组/对象会让 `active not in names` 抛 TypeError，
+    # 那会绕过 credential_plan 的 AccountsError 回退，让整轮签到直接退出。
+    if active is not None and not isinstance(active, str):
+        raise AccountsError("ERROR", "账号清单的 active 字段无效（应为账号名或 null）")
     if active not in names:
         active = entries[0]["name"] if entries else None
     return {"version": ACCOUNTS_VERSION, "active": active, "accounts": entries}
@@ -867,15 +953,22 @@ def _uid_hint(uid):
 
 
 def order_accounts(registry):
-    """轮转顺序：当前账号排最前，其余按"上次运行时间"从早到晚，保证每个账号都轮到。
+    """轮转顺序：按"上次运行时间"从早到晚，没跑过的优先。
 
-    last_run_at 是 ISO 时间串，同一格式下字典序即时间序；没跑过的排最前。
+    这样被 DEFERRED 的账号（这一轮没轮到、last_run_at 没更新）下一轮自然排到最前面，
+    连续多轮预算不足时也不会永远只跑同一个账号。只有在还没跑过的账号之间才让当前
+    账号优先，保证首次轮转符合使用者的预期。
+
+    last_run_at 是 ISO 时间串，同一格式下字典序即时间序。
     """
-    accounts = list(registry["accounts"])
     active = registry.get("active")
-    rest = [a for a in accounts if a["name"] != active]
-    rest.sort(key=lambda a: (a.get("last_run_at") or "", a["name"]))
-    return [a for a in accounts if a["name"] == active] + rest
+
+    def sort_key(account):
+        stamp = account.get("last_run_at") or ""
+        # 没跑过的账号里，当前账号排最前；一旦跑过就只按时间排。
+        return (stamp, 0 if (not stamp and account["name"] == active) else 1, account["name"])
+
+    return sorted(registry["accounts"], key=sort_key)
 
 
 def _expires_text(value):
@@ -915,6 +1008,9 @@ def bind_account(name, source=None, force=False):
     if not _valid_account_name(name):
         raise AccountsError("ERROR", "账号名无效：只能用中英文、数字、点、下划线、短横线，"
                                      "1-32 个字符，且不能以符号开头")
+    if name.lower() in RESERVED_ACCOUNT_NAMES:
+        raise AccountsError("ERROR", "「%s」是保留名：--account current/client 已经表示客户端"
+                                     "当前登录，请换一个账号名" % name)
     path = source or find_auth_file()[0]
     if not path:
         raise AccountsError("NO_AUTH", "未找到当前登录凭据，请先登录 WorkBuddy 桌面端，"
@@ -937,28 +1033,56 @@ def bind_account(name, source=None, force=False):
 
     uid = session["account"]["uid"]
     endpoint = ((session.get("auth") or {}).get("endpoint") or DEFAULT_ENDPOINT).rstrip("/")
-    registry = load_registry()
-    for other in registry["accounts"]:
-        if other["name"] == name:
-            if not force:
-                raise AccountsError("ERROR", "账号「%s」已绑定；要更新凭据请加 --force" % name)
-        elif other["uid"] == uid and not force:
-            raise AccountsError("ERROR", "该登录账号已绑定为「%s」；如需重复绑定请加 --force"
-                                % other["name"])
+    credential = _credential_filename(name)
+    target = os.path.join(accounts_dir(), credential)
+    target_key = os.path.normcase(os.path.abspath(target))
+    with _registry_lock():
+        registry = load_registry()
+        previous = None
+        for other in registry["accounts"]:
+            if other["name"] == name:
+                previous = other
+                if not force:
+                    raise AccountsError("ERROR", "账号「%s」已绑定；要更新凭据请加 --force" % name)
+            elif other["name"].lower() == name.lower() and not force:
+                # Windows 上 work / Work 在列表里几乎无法分辨，未加 --force 时拒绝。
+                raise AccountsError("ERROR", "已有账号「%s」与「%s」只差大小写；"
+                                             "确实要同时保留请加 --force" % (other["name"], name))
+            elif other["uid"] == uid and not force:
+                raise AccountsError("ERROR", "该登录账号已绑定为「%s」；如需重复绑定请加 --force"
+                                    % other["name"])
+            if other["name"] != name and \
+                    os.path.normcase(os.path.abspath(credential_path(other))) == target_key:
+                raise AccountsError("ERROR", "账号「%s」的凭据文件与新账号冲突，请先解绑它"
+                                    % other["name"])
 
-    credential = urllib.parse.quote(name, safe="") + ".info"
-    entry = {"name": name, "uid": uid, "endpoint": endpoint, "credential": credential,
-             "bound_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-             "last_run_at": "", "last_result": "", "last_code": 0}
-    _atomic_write(os.path.join(accounts_dir(), credential), raw)
-    accounts = [a for a in registry["accounts"] if a["name"] != name]
-    accounts.append(entry)
-    registry["accounts"] = accounts
-    if not registry.get("active"):
-        registry["active"] = name
-    save_registry(registry)
+        entry = {"name": name, "uid": uid, "endpoint": endpoint, "credential": credential,
+                 "bound_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                 "last_run_at": "", "last_result": "", "last_code": 0}
+        _atomic_write(target, raw)
+        accounts = [a for a in registry["accounts"] if a["name"] != name]
+        accounts.append(entry)
+        registry["accounts"] = accounts
+        if not registry.get("active"):
+            registry["active"] = name
+        save_registry(registry)
+
+        # 旧版本用账号名直接做文件名，--force 更新后会留下没人引用的旧快照（含令牌）。
+        stale = credential_path(previous) if previous else None
+        if stale:
+            stale_key = os.path.normcase(os.path.abspath(stale))
+            if stale_key == target_key or any(
+                    os.path.normcase(os.path.abspath(credential_path(a))) == stale_key
+                    for a in registry["accounts"]):
+                stale = None
+        if stale:
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
+
     return {"account": name, "uid": _uid_hint(uid), "endpoint": endpoint,
-            "credential": os.path.join(accounts_dir(), credential),
+            "credential": target,
             "active": registry["active"],
             "report": "已绑定账号「%s」（uid %s），当前共 %d 个账号%s" % (
                 name, _uid_hint(uid) or "-", len(accounts),
@@ -966,31 +1090,40 @@ def bind_account(name, source=None, force=False):
 
 
 def use_account(name):
-    registry = load_registry()
-    entry = next((a for a in registry["accounts"] if a["name"] == name), None)
-    if entry is None:
-        raise AccountsError("ERROR", "未绑定账号「%s」；用 signin.py accounts 查看已绑定账号" % name)
-    registry["active"] = name
-    save_registry(registry)
+    with _registry_lock():
+        registry = load_registry()
+        entry = next((a for a in registry["accounts"] if a["name"] == name), None)
+        if entry is None:
+            raise AccountsError("ERROR", "未绑定账号「%s」；用 signin.py accounts 查看已绑定账号"
+                                % name)
+        registry["active"] = name
+        save_registry(registry)
     return {"account": name, "uid": _uid_hint(entry["uid"]), "active": name,
             "report": "当前账号已切换为「%s」" % name}
 
 
 def unbind_account(name):
-    registry = load_registry()
-    entry = next((a for a in registry["accounts"] if a["name"] == name), None)
-    if entry is None:
-        raise AccountsError("ERROR", "未绑定账号「%s」；用 signin.py accounts 查看已绑定账号" % name)
-    registry["accounts"] = [a for a in registry["accounts"] if a["name"] != name]
-    if registry.get("active") == name:
-        registry["active"] = registry["accounts"][0]["name"] if registry["accounts"] else None
-    save_registry(registry)
-    removed = False
-    try:
-        os.unlink(credential_path(entry))
-        removed = True
-    except OSError:
-        pass
+    with _registry_lock():
+        registry = load_registry()
+        entry = next((a for a in registry["accounts"] if a["name"] == name), None)
+        if entry is None:
+            raise AccountsError("ERROR", "未绑定账号「%s」；用 signin.py accounts 查看已绑定账号"
+                                % name)
+        registry["accounts"] = [a for a in registry["accounts"] if a["name"] != name]
+        if registry.get("active") == name:
+            registry["active"] = registry["accounts"][0]["name"] if registry["accounts"] else None
+        save_registry(registry)
+        removed = False
+        path = credential_path(entry)
+        path_key = os.path.normcase(os.path.abspath(path))
+        shared = any(os.path.normcase(os.path.abspath(credential_path(a))) == path_key
+                     for a in registry["accounts"])
+        if not shared:
+            try:
+                os.unlink(path)
+                removed = True
+            except OSError:
+                pass
     return {"account": name, "credential_removed": removed, "active": registry.get("active"),
             "report": "已解绑账号「%s」，还剩 %d 个账号" % (name, len(registry["accounts"]))}
 
@@ -1080,16 +1213,31 @@ def credential_plan(explicit=None, rotate=True):
     if not rotate:
         active = registry.get("active")
         entries = [a for a in entries if a["name"] == active][:1] or entries[:1]
-    contexts = []
-    seen = set()
+
+    # 按 uid 分组，但先给每个身份挑一份可用快照，再去重：否则「过期/丢失的同 uid 快照」
+    # 排在前面时，后面那份有效快照会被当成重复身份跳过，整轮只剩一个 EXPIRED。
+    groups = {}
     for entry in entries:
-        # 同一个登录身份被绑成两个名字时只跑一次：重复签到幂等，但白花一次预算。
-        if entry["uid"] and entry["uid"] in seen:
-            warnings.append("账号「%s」与前面的账号是同一个登录身份，已跳过" % entry["name"])
-            continue
-        seen.add(entry["uid"])
-        path = credential_path(entry)
-        contexts.append((entry["name"], path if os.path.exists(path) else None, entry))
+        key = entry["uid"] or ("#name#%s" % entry["name"])
+        groups.setdefault(key, []).append(entry)
+
+    contexts = []
+    for group in groups.values():
+        chosen = None
+        fallback = None
+        for entry in group:
+            path, usable = _snapshot_state(entry)
+            if fallback is None:
+                fallback = (entry, path)
+            if usable:
+                chosen = (entry, path)
+                break
+        entry, path = chosen or fallback
+        if len(group) > 1:
+            skipped = "、".join("「%s」" % a["name"] for a in group if a["name"] != entry["name"])
+            warnings.append("账号「%s」与%s是同一个登录身份，本次只跑「%s」"
+                            % (entry["name"], skipped, entry["name"]))
+        contexts.append((entry["name"], path if path and os.path.exists(path) else None, entry))
     return contexts, warnings
 
 
@@ -1097,22 +1245,23 @@ def _record_account_run(name, out, code):
     """把本次结果记回清单，供下一次轮转排序与 accounts 展示；失败不影响主流程。"""
     if not name:
         return
+    # 用短超时：定时任务不该为了记一行状态而卡住整轮预算。
     try:
-        registry = load_registry()
-    except AccountsError:
-        return
-    for entry in registry["accounts"]:
-        if entry["name"] == name:
-            entry["last_run_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
-            entry["last_result"] = str(out.get("result") or "UNKNOWN")[:64]
-            entry["last_code"] = as_int(code, 0)
-            break
-    else:
-        return
-    try:
-        save_registry(registry)
+        with _registry_lock(timeout=2.0):
+            registry = load_registry()
+            for entry in registry["accounts"]:
+                if entry["name"] == name:
+                    entry["last_run_at"] = datetime.now().astimezone().isoformat(
+                        timespec="seconds")
+                    entry["last_result"] = str(out.get("result") or "UNKNOWN")[:64]
+                    entry["last_code"] = as_int(code, 0)
+                    break
+            else:
+                return
+            save_registry(registry)
     except Exception:
-        pass
+        # 记状态是尽力而为：锁超时、磁盘满、清单损坏都不能拖垮本轮签到。
+        return
 
 
 def build_headers(session):
@@ -2166,7 +2315,14 @@ def run_daily(headers, endpoint):
                           "report": "成长中心异常（%s: %s）" % (type(e).__name__, e)}
     out["growth"] = gout.get("report")
     out["growth_result"] = gout.get("result")
-    if gout.get("credits_gained") or gcode != 0:
+    # 统一积分口径：本次新领到的 = 签到实发（仅 CLAIMED）+ 成长中心实发。
+    # ALREADY 里的 today_credit / total_credits 是历史值，绝不能算进"本次新增"，否则
+    # 多账号汇总会把每天的历史积分重复累加。
+    growth_credits = as_int(gout.get("credits_gained"), 0)
+    checkin_credits = as_int(out.get("credit"), 0) if out.get("result") == "CLAIMED" else 0
+    out["growth_credits"] = growth_credits
+    out["credits_gained"] = checkin_credits + growth_credits
+    if growth_credits or gcode != 0:
         out["report"] += "；" + gout["report"]
     # 成长中心有需要处理的失败即返回非零；保留签到成功结果，同时透传提醒。
     if gcode != 0 and code == 0:

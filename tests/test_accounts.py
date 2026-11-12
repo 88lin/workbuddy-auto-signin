@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -173,13 +174,23 @@ class SwitchTests(AccountTestCase):
         self.assertIn("已绑定 2 个账号", out["report"])
         self.assertTrue(all(row["credential_exists"] for row in out["accounts"]))
 
-    def test_order_puts_active_first_then_oldest(self):
+    def test_order_is_oldest_run_first_and_active_leads_never_run(self):
         self.bind_ab()
         registry = signin.load_registry()
         registry["active"] = "b"
         registry["accounts"][0]["last_run_at"] = "2026-11-12T10:00:00+08:00"
         registry["accounts"][1]["last_run_at"] = "2026-11-12T09:00:00+08:00"
         signin.save_registry(registry)
+        # 跑过的账号按上次运行时间从早到晚，当前账号不再无条件插队
+        self.assertEqual([a["name"] for a in signin.order_accounts(signin.load_registry())],
+                         ["b", "a"])
+
+        registry = signin.load_registry()
+        registry["active"] = "b"
+        for account in registry["accounts"]:
+            account["last_run_at"] = ""
+        signin.save_registry(registry)
+        # 都没跑过时，当前账号先跑
         self.assertEqual([a["name"] for a in signin.order_accounts(signin.load_registry())],
                          ["b", "a"])
 
@@ -405,6 +416,234 @@ class RotationTests(AccountTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(fake.call_count, 2)
         self.assertEqual(emitted[-1]["result"], "ALL")
+
+
+class SnapshotIdentityTests(AccountTestCase):
+    def test_case_variant_bind_requires_force(self):
+        self.bind("work", credential(uid=UID_A, token="token-a"))
+        self.write_client(credential(uid=UID_B, token="token-b"))
+        with self.assertRaises(signin.AccountsError):
+            self.bind("Work")
+        self.assertEqual([a["name"] for a in signin.load_registry()["accounts"]], ["work"])
+
+    def test_forced_case_variants_keep_independent_snapshots(self):
+        self.bind("work", credential(uid=UID_A, token="token-a"))
+        self.bind("Work", credential(uid=UID_B, token="token-b"), force=True)
+        entries = {a["name"]: a for a in signin.load_registry()["accounts"]}
+        self.assertNotEqual(entries["work"]["credential"], entries["Work"]["credential"])
+        first = Path(signin.credential_path(entries["work"]))
+        second = Path(signin.credential_path(entries["Work"]))
+        self.assertNotEqual(os.path.normcase(str(first)), os.path.normcase(str(second)))
+        self.assertIn("token-a", first.read_text(encoding="utf-8"))
+        self.assertIn("token-b", second.read_text(encoding="utf-8"))
+
+        signin.unbind_account("Work")
+        self.assertTrue(first.exists(), "解绑 Work 不能删掉 work 的快照")
+        self.assertFalse(second.exists())
+
+    def test_unbind_keeps_snapshot_shared_with_legacy_entry(self):
+        # 旧版本用账号名当文件名，历史清单里可能有两个条目指向同一份文件。
+        self.accounts_root.mkdir(parents=True, exist_ok=True)
+        shared = self.accounts_root / "shared.info"
+        shared.write_text(json.dumps(credential()), encoding="utf-8")
+        base = {"uid": UID_A, "endpoint": "https://example.com", "bound_at": "",
+                "last_run_at": "", "last_result": "", "last_code": 0}
+        registry = {"version": 1, "active": "a", "accounts": [
+            dict(base, name="a", credential="shared.info"),
+            dict(base, name="b", uid=UID_B, credential="shared.info")]}
+        (self.accounts_root / "accounts.json").write_text(json.dumps(registry), encoding="utf-8")
+
+        out = signin.unbind_account("a")
+        self.assertFalse(out["credential_removed"])
+        self.assertTrue(shared.exists(), "另一个条目还在引用这份快照，不能删")
+
+
+class SnapshotSelectionTests(AccountTestCase):
+    def test_usable_duplicate_snapshot_wins_over_expired_one(self):
+        past = (time.time() - 3600) * 1000
+        self.bind("old", credential(uid=UID_A, token="token-old", expires_at=past))
+        self.bind("fresh", credential(uid=UID_A, token="token-fresh"), force=True)
+        signin.use_account("old")
+
+        seen = []
+
+        def daily(headers, endpoint):
+            seen.append(account_token(headers))
+            return 0, {"result": "ALREADY", "report": "ok"}, True
+
+        with patch.object(signin, "run_daily", side_effect=daily), patch.object(signin, "emit"):
+            self.assertEqual(signin._run("auto"), 0)
+        self.assertEqual(seen, ["token-fresh"])
+
+    def test_all_duplicates_unusable_still_reports_the_error(self):
+        past = (time.time() - 3600) * 1000
+        self.bind("old", credential(uid=UID_A, token="token-old", expires_at=past))
+        self.bind("fresh", credential(uid=UID_A, token="token-fresh", expires_at=past),
+                  force=True)
+        signin.use_account("old")
+
+        emitted = []
+        with patch.object(signin, "run_daily") as daily, \
+                patch.object(signin, "emit", side_effect=lambda out, step: emitted.append(out)):
+            self.assertEqual(signin._run("auto"), 1)
+        daily.assert_not_called()
+        self.assertEqual(emitted[-1]["result"], "EXPIRED")
+
+
+class RegistryLockTests(AccountTestCase):
+    def test_lock_is_exclusive_across_threads(self):
+        acquired = []
+
+        def worker():
+            with signin._registry_lock(timeout=5):
+                acquired.append(True)
+
+        with signin._registry_lock():
+            thread = threading.Thread(target=worker)
+            thread.start()
+            time.sleep(0.2)
+            self.assertEqual(acquired, [])
+        thread.join(5)
+        self.assertEqual(acquired, [True])
+
+    def test_lock_timeout_raises_accounts_error(self):
+        with signin._registry_lock():
+            with self.assertRaises(signin.AccountsError):
+                with signin._registry_lock(timeout=0.2):
+                    pass
+
+    def test_status_update_does_not_resurrect_unbound_entry(self):
+        self.bind_ab()
+        with signin._registry_lock():
+            thread = threading.Thread(target=signin._record_account_run,
+                                      args=("a", {"result": "ALREADY"}, 0))
+            thread.start()
+            time.sleep(0.2)
+            self.assertTrue(thread.is_alive(), "记录状态也要排队等锁")
+            # 模拟另一个进程在这期间解绑了 b
+            registry = signin.load_registry()
+            registry["accounts"] = [x for x in registry["accounts"] if x["name"] != "b"]
+            signin.save_registry(registry)
+        thread.join(5)
+        self.assertEqual([a["name"] for a in signin.load_registry()["accounts"]], ["a"])
+
+
+class FairnessTests(AccountTestCase):
+    def setUp(self):
+        super().setUp()
+        self.bind_ab()
+        self.calls = []
+
+    def fake_daily(self):
+        def run(headers, endpoint):
+            self.calls.append(account_token(headers))
+            return 0, {"result": "CLAIMED", "report": "ok"}, True
+        return run
+
+    def test_deferred_account_runs_first_next_round(self):
+        with patch.object(signin, "run_daily", side_effect=self.fake_daily()), \
+                patch.object(signin, "emit"):
+            # 第一轮：a 分到 30 秒跑完，剩 10 秒不够再开 b
+            with patch.object(signin, "_budget_left", side_effect=[60.0, 10.0]):
+                self.assertEqual(signin._run("auto"), 0)
+            self.assertEqual(self.calls, ["token-a"])
+            stamps = {a["name"]: a["last_run_at"]
+                      for a in signin.load_registry()["accounts"]}
+            self.assertTrue(stamps["a"])
+            self.assertEqual(stamps["b"], "")
+
+            # 第二轮：被推迟的 b（没跑过）应当排到前面
+            self.calls.clear()
+            with patch.object(signin, "_budget_left", side_effect=[60.0, 60.0]):
+                self.assertEqual(signin._run("auto"), 0)
+        self.assertEqual(self.calls, ["token-b", "token-a"])
+
+    def test_tight_budget_alternates_instead_of_starving(self):
+        with patch.object(signin, "run_daily", side_effect=self.fake_daily()), \
+                patch.object(signin, "emit"):
+            for expected in (["token-a"], ["token-b"], ["token-a"]):
+                self.calls.clear()
+                # 每轮都只够跑一个账号
+                with patch.object(signin, "_budget_left", side_effect=[60.0, 10.0]):
+                    self.assertEqual(signin._run("auto"), 0)
+                self.assertEqual(self.calls, expected)
+
+
+class CreditAggregationTests(AccountTestCase):
+    def run_daily_with(self, auto, growth):
+        with patch.object(signin, "run_auto", return_value=auto), \
+                patch.object(signin, "run_growth", return_value=growth):
+            return signin.run_daily({}, "https://example.com")
+
+    def test_checkin_and_growth_credits_are_summed(self):
+        code, out, _ = self.run_daily_with(
+            (0, {"result": "CLAIMED", "credit": 100, "report": "领了"}),
+            (0, {"result": "GROWTH", "report": "成长", "credits_gained": 50, "idle": False}))
+        self.assertEqual(code, 0)
+        self.assertEqual(out["credits_gained"], 150)
+        self.assertEqual(out["growth_credits"], 50)
+
+    def test_already_history_is_not_counted_as_new(self):
+        code, out, _ = self.run_daily_with(
+            (0, {"result": "ALREADY", "today_credit": 100, "total_credits": 700,
+                 "report": "已签"}),
+            (0, {"result": "GROWTH", "report": "成长", "credits_gained": 50, "idle": False}))
+        self.assertEqual(code, 0)
+        self.assertEqual(out["credits_gained"], 50)
+
+    def test_multi_account_total_uses_real_run_daily_fields(self):
+        self.bind_ab()
+
+        def auto(headers, endpoint):
+            if account_token(headers) == "token-a":
+                return 0, {"result": "CLAIMED", "credit": 100, "report": "a 领"}
+            return 0, {"result": "ALREADY", "today_credit": 100, "report": "b 已签"}
+
+        with patch.object(signin, "run_auto", side_effect=auto), \
+                patch.object(signin, "run_growth",
+                             return_value=(0, {"result": "GROWTH", "report": "成长",
+                                               "credits_gained": 50, "idle": False})), \
+                patch.object(signin, "emit") as emit:
+            self.assertEqual(signin._run("auto"), 0)
+        self.assertEqual(emit.call_args.args[0]["credits_gained"], 200)
+
+
+class ReservedNameTests(AccountTestCase):
+    def test_reserved_names_cannot_be_bound(self):
+        for name in ("current", "client", "CURRENT", "Client", "cLiEnT"):
+            with self.subTest(name=name), self.assertRaises(signin.AccountsError):
+                self.bind(name)
+        self.assertFalse((self.accounts_root / "accounts.json").exists())
+
+    def test_account_current_still_selects_the_client_login(self):
+        self.bind("work")
+        self.write_client(credential(uid=UID_LIVE, token="token-live"))
+        seen = []
+
+        def daily(headers, endpoint):
+            seen.append(account_token(headers))
+            return 0, {"result": "ALREADY", "report": "ok"}, True
+
+        with patch.object(signin, "run_daily", side_effect=daily), patch.object(signin, "emit"):
+            self.assertEqual(signin._run("auto", "current"), 0)
+        self.assertEqual(seen, ["token-live"])
+
+
+class ActiveFieldTests(AccountTestCase):
+    def test_non_string_active_falls_back_to_client_login(self):
+        self.accounts_root.mkdir(parents=True, exist_ok=True)
+        for value in ([], {}, 0, True):
+            with self.subTest(value=value):
+                (self.accounts_root / "accounts.json").write_text(json.dumps(
+                    {"version": 1, "active": value, "accounts": []}), encoding="utf-8")
+                with self.assertRaises(signin.AccountsError):
+                    signin.load_registry()
+
+        with patch.object(signin, "run_daily",
+                          return_value=(0, {"result": "ALREADY", "report": "今日已签过"}, True)), \
+                patch.object(signin, "emit") as emit:
+            self.assertEqual(signin._run("auto"), 0)
+        self.assertIn("active", emit.call_args.args[0]["account_warnings"][0])
 
 
 class CommandLineTests(AccountTestCase):
