@@ -871,11 +871,13 @@ def _account_entry(item):
         raise AccountsError("ERROR", "账号清单格式无效（记录不是对象）")
     name = item.get("name")
     if not _valid_account_name(name):
-        raise AccountsError("ERROR", "账号清单里有无效的账号名：%r" % (name,))
+        raise AccountsError("ERROR", "账号清单里有无效的账号名（应为合法名称字符串）")
     credential = item.get("credential")
     if (not isinstance(credential, str) or not credential
             or os.path.basename(credential) != credential or credential in (".", "..")
-            or "\\" in credential or ":" in credential):
+            or "\\" in credential or ":" in credential
+            or credential.rstrip(" .").casefold() in
+            (ACCOUNTS_REGISTRY_NAME.casefold(), REGISTRY_LOCK_NAME.casefold())):
         raise AccountsError("ERROR", "账号「%s」的凭据文件名无效" % name)
 
     def text(field, limit):
@@ -898,8 +900,8 @@ def _registry_from(data):
         raise AccountsError("ERROR", "账号清单格式无效（不是 JSON 对象）")
     version = data.get("version")
     if type(version) is not int or version != ACCOUNTS_VERSION:
-        raise AccountsError("ERROR", "账号清单版本不受支持（%r），请删除清单后重新 bind"
-                            % (version,))
+        raise AccountsError("ERROR", "账号清单版本不受支持（应为受支持的整数版本），"
+                            "请修复清单后重试")
     raw = data.get("accounts", [])
     if not isinstance(raw, list):
         raise AccountsError("ERROR", "账号清单格式无效（accounts 不是数组）")
@@ -936,6 +938,7 @@ def load_registry():
 
 
 def save_registry(registry):
+    registry = _registry_from(registry)
     _atomic_write(_registry_path(),
                   (json.dumps(registry, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
@@ -1085,9 +1088,10 @@ def bind_account(name, source=None, force=False):
                 raise AccountsError("ERROR", "账号「%s」的凭据文件与新账号冲突，请先解绑它"
                                     % other["name"])
 
-        entry = {"name": name, "uid": uid, "endpoint": endpoint, "credential": credential,
-                 "bound_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-                 "last_run_at": "", "last_result": "", "last_code": 0}
+        entry = _account_entry({
+            "name": name, "uid": uid, "endpoint": endpoint, "credential": credential,
+            "bound_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "last_run_at": "", "last_result": "", "last_code": 0})
         # 发布新版本的引用后才能删除旧快照；清单提交失败时旧引用/内容保持不变。
         try:
             _atomic_write(target, raw)
@@ -1295,7 +1299,8 @@ def credential_plan(explicit=None, rotate=True):
     # 快照」排在前面时，后面那份有效快照会被当成重复身份跳过，整轮只剩一个错误。
     groups = {}
     for entry in entries:
-        key = entry["uid"] or ("#name#%s" % entry["name"])
+        # 缺失 UID 的旧记录按名称独立分组，键的类型避免与真实 UID 字符串碰撞。
+        key = ("uid", entry["uid"]) if entry["uid"] else ("name", entry["name"])
         groups.setdefault(key, []).append(entry)
 
     # 轮转顺序按「登录身份」排，不按别名排：同 uid 的旧别名可能永远没有运行时间，
@@ -2631,7 +2636,8 @@ def _run_one_account(action, auth_file, label=None, entry=None):
             raise AuthError("UID_MISMATCH")
         if action == "doctor":
             return 0, run_doctor(session), False, []
-        expired = _session_expired(session)
+        # 过期预判只适用于绑定快照；客户端当前登录沿用原有服务端认证行为。
+        expired = _session_expired(session) if entry else None
         if expired:
             hint = ("signin.py bind %s --force" % label) if label else "bind --force"
             return 1, {"result": "EXPIRED", "needs_attention": True,
@@ -2654,7 +2660,8 @@ def _run_rotation(action, contexts, warnings):
     """多账号串行：一个账号跑完再切下一个；单个账号失败不中断其余账号。
 
     预算在同一份总预算里按"剩余时间 / 剩余账号数"切片（见 _budget_slice），
-    切出来的时间片不够开一个新账号时，剩下的账号记 DEFERRED 留给下一轮——
+    已启动的账号至少取得 ACCOUNT_MIN_SLICE；总剩余时间不够启动新账号时，
+    剩下的账号记 DEFERRED 留给下一轮——
     绝不能让定时任务跑穿 ExecutionTimeLimit 被系统强杀，那样连日志都写不出来。
     """
     total = len(contexts)
@@ -2671,7 +2678,7 @@ def _run_rotation(action, contexts, warnings):
                                 "code": 0, "report": "时间预算不足，留到下一轮"})
             quiet_all = False
             break
-        _budget_slice(remaining / (total - index))
+        _budget_slice(max(ACCOUNT_MIN_SLICE, remaining / (total - index)))
         try:
             code, out, quiet, _ = _run_one_account(action, path, label, entry)
         except Exception as e:

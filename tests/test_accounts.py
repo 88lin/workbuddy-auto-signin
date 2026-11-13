@@ -4,6 +4,7 @@
 """
 
 import base64
+from datetime import timedelta
 import io
 import json
 import os
@@ -153,6 +154,35 @@ class BindTests(AccountTestCase):
 
 
 class BindTransactionTests(AccountTestCase):
+    def test_metadata_outside_registry_limits_is_rejected_before_first_write(self):
+        sessions = [credential(uid="u" * 257),
+                    credential(endpoint="https://example.com/" + "x" * 2049)]
+        for session in sessions:
+            with self.subTest(session=session), patch.object(signin, "_atomic_write") as write:
+                with self.assertRaises(signin.AccountsError):
+                    self.bind("work", session)
+                write.assert_not_called()
+            self.assertEqual(signin.load_registry()["accounts"], [])
+
+    def test_invalid_metadata_force_update_preserves_original_binding(self):
+        self.bind("work", credential())
+        entry = signin.find_account("work")
+        original = Path(signin.credential_path(entry)).read_bytes()
+        registry_bytes = Path(signin._registry_path()).read_bytes()
+        for session in (credential(uid="u" * 257),
+                        credential(endpoint="https://example.com/" + "x" * 2049)):
+            with self.subTest(session=session), self.assertRaises(signin.AccountsError):
+                self.bind("work", session, force=True)
+            self.assert_original_binding(registry_bytes, entry, original)
+
+    def test_metadata_at_registry_limits_remains_supported(self):
+        prefix = "https://example.com/"
+        self.bind("work", credential(uid="u" * 256,
+                                     endpoint=prefix + "x" * (2048 - len(prefix))))
+        entry = signin.find_account("work")
+        self.assertEqual(len(entry["uid"]), 256)
+        self.assertEqual(len(entry["endpoint"]), 2048)
+
     def assert_original_binding(self, registry_bytes, entry, snapshot_bytes):
         self.assertEqual(Path(signin._registry_path()).read_bytes(), registry_bytes)
         self.assertEqual(signin.find_account("work"), entry)
@@ -391,7 +421,92 @@ class UnbindCleanupTests(AccountTestCase):
         self.assertEqual(signin.load_registry()["accounts"], [])
 
 
+class ConcurrentBindTests(AccountTestCase):
+    def run_concurrent_binds(self, same_name=False, same_uid=False):
+        gate = self.root / "start"
+        code = """
+import os, sys, time
+from pathlib import Path
+import signin
+source, name, gate, ready, force = sys.argv[1:]
+save = signin.save_registry
+def slow_save(registry):
+    time.sleep(0.03)
+    save(registry)
+signin.save_registry = slow_save
+Path(ready).touch()
+while not Path(gate).exists():
+    time.sleep(0.01)
+try:
+    signin.bind_account(name, source=source, force=force == '1')
+except signin.AccountsError:
+    sys.exit(1)
+"""
+        processes = []
+        try:
+            for index in range(6):
+                source = self.root / ("source-%d.json" % index)
+                source.write_text(json.dumps(credential(
+                    uid=UID_A if same_uid else "uid-%d" % index,
+                    token="fake-token-%d" % index)), encoding="utf-8")
+                processes.append(subprocess.Popen([
+                    sys.executable, "-c", code, str(source),
+                    "work" if same_name else "work-%d" % index,
+                    str(gate), str(self.root / ("ready-%d" % index)),
+                    "1" if same_name else "0"],
+                    cwd=str(Path(signin.__file__).parent),
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+            deadline = time.monotonic() + 20
+            while len(list(self.root.glob("ready-*"))) < len(processes):
+                self.assertLess(time.monotonic(), deadline, "Child processes did not become ready")
+                time.sleep(0.01)
+            gate.touch()
+            statuses = []
+            for process in processes:
+                stdout, stderr = process.communicate(timeout=20)
+                self.assertEqual(stderr, b"")
+                statuses.append(process.returncode)
+        finally:
+            for process in processes:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=5)
+        registry = signin.load_registry()
+        entries = registry["accounts"]
+        expected_count = 1 if same_name or same_uid else 6
+        self.assertEqual(len(entries), expected_count)
+        self.assertEqual(statuses.count(0), 1 if same_uid else 6)
+        self.assertEqual({path.name for path in self.accounts_root.glob("*.info")},
+                         {entry["credential"] for entry in entries})
+        for entry in entries:
+            self.assertEqual(signin.load_session(signin.credential_path(entry))["account"]["uid"],
+                             entry["uid"])
+
+    def test_concurrent_binds_keep_every_identity_and_snapshot(self):
+        self.run_concurrent_binds()
+
+    def test_concurrent_force_updates_publish_one_consistent_version(self):
+        self.run_concurrent_binds(same_name=True)
+
+    def test_concurrent_duplicate_identity_binds_only_once(self):
+        self.run_concurrent_binds(same_uid=True)
+
+
 class RegistryValidationTests(AccountTestCase):
+    def test_internal_files_cannot_be_used_as_credential_paths(self):
+        for filename in (signin.ACCOUNTS_REGISTRY_NAME, signin.REGISTRY_LOCK_NAME,
+                         "ACCOUNTS.JSON", ".REGISTRY.LOCK", "accounts.json. ", ".registry.lock."):
+            with self.subTest(filename=filename), self.assertRaises(signin.AccountsError):
+                signin._registry_from({"version": 1, "active": "a", "accounts": [
+                    {"name": "a", "credential": filename, "uid": UID_A}]})
+
+    def test_registry_writer_rejects_invalid_payload_before_touching_disk(self):
+        with patch.object(signin, "_atomic_write") as write:
+            with self.assertRaises(signin.AccountsError):
+                signin.save_registry({"version": 1, "accounts": [
+                    {"name": "a", "credential": signin.REGISTRY_LOCK_NAME, "uid": UID_A}]})
+        write.assert_not_called()
+
     def test_missing_registry_is_empty_not_an_error(self):
         self.assertEqual(signin.load_registry()["accounts"], [])
 
@@ -432,6 +547,118 @@ class RegistryValidationTests(AccountTestCase):
                     json.dumps(payload), encoding="utf-8")
                 with self.assertRaises(signin.AccountsError):
                     signin.load_registry()
+
+
+class RegistryErrorPrivacyTests(AccountTestCase):
+    def invalid_payloads(self, secret):
+        return [{"version": {"auth": {"accessToken": secret}}, "accounts": []},
+                {"version": [secret], "accounts": []},
+                {"version": 1, "accounts": [{"name": {"auth": {"accessToken": secret}}}]},
+                {"version": 1, "accounts": [{"name": [secret]}]}]
+
+    def write_invalid(self, payload):
+        self.accounts_root.mkdir(parents=True, exist_ok=True)
+        Path(signin._registry_path()).write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_invalid_metadata_is_not_echoed_in_fallback_stdout_or_silent_log(self):
+        secret = "fake-unresolved-secret-0123456789"
+        log = self.root / "signin.log"
+        for payload in self.invalid_payloads(secret):
+            for action in ("auto", "silent"):
+                self.write_invalid(payload)
+                stdout = io.StringIO()
+                with self.subTest(payload=payload, action=action), patch("sys.stdout", stdout), \
+                        patch.object(signin, "run_daily", return_value=(0, {
+                            "result": "ALREADY", "report": "ok"}, True)):
+                    self.assertEqual(signin._run(action), 0)
+                    self.assertNotIn(secret, stdout.getvalue())
+                    self.assertNotIn(secret, log.read_text(encoding="utf-8") if log.exists() else "")
+
+    def test_invalid_metadata_is_not_echoed_in_management_errors(self):
+        secret = "fake-unresolved-secret-0123456789"
+        for payload in self.invalid_payloads(secret):
+            self.write_invalid(payload)
+            stdout = io.StringIO()
+            with self.subTest(payload=payload), patch("sys.stdout", stdout):
+                self.assertEqual(signin.main(["accounts"]), 1)
+                self.assertNotIn(secret, stdout.getvalue())
+                self.assertNotIn(secret, (self.root / "signin.log").read_text(encoding="utf-8"))
+
+
+class LegacyClientCompatibilityTests(AccountTestCase):
+    def verify_stale_client_metadata(self, account=None):
+        self.write_client(credential(uid=UID_LIVE, token="fake-live-client-token",
+                                     expires_at=(time.time() - 3600) * 1000))
+        with patch.object(signin, "_request", return_value=(200, {
+                "active": True, "today_checked_in": True})) as request, \
+                patch.object(signin, "run_growth", return_value=(0, {
+                    "result": "GROWTH", "report": "idle", "credits_gained": 0, "idle": True})), \
+                patch.object(signin, "emit") as emit:
+            self.assertEqual(signin._run("auto", account=account), 0)
+        self.assertEqual(request.call_args.kwargs["method"], "POST")
+        self.assertEqual(account_token(request.call_args.args[1]), "fake-live-client-token")
+        self.assertEqual(emit.call_args.args[0]["result"], "ALREADY")
+        return emit.call_args.args[0]
+
+    def test_client_login_keeps_service_validation_for_stale_expiry_metadata(self):
+        self.verify_stale_client_metadata()
+        self.bind("other", credential(uid=UID_B, token="token-other"))
+        for account in ("current", "client"):
+            with self.subTest(account=account):
+                self.verify_stale_client_metadata(account)
+
+    def test_corrupt_registry_fallback_keeps_client_authentication_behavior(self):
+        self.accounts_root.mkdir(parents=True, exist_ok=True)
+        Path(signin._registry_path()).write_text('{"version": 2}', encoding="utf-8")
+        self.assertTrue(self.verify_stale_client_metadata()["account_warnings"])
+
+
+class BudgetProgressTests(AccountTestCase):
+    def verify_slow_rotation(self, count, budget, action):
+        for index in range(count):
+            self.bind("a%02d" % index, credential(uid="uid-%02d" % index,
+                                                 token="token-%02d" % index))
+        clock = [1000.0]
+        moment = signin.datetime
+        wall_base = moment.fromisoformat("2026-11-13T12:00:00+08:00")
+        outputs, seen = [], []
+
+        def request(url, headers, method, payload, timeout):
+            if timeout < 25:
+                clock[0] += timeout
+                return signin.CODE_NO_NETWORK, {"error": "simulated timeout"}
+            clock[0] += 25
+            seen.append(account_token(headers))
+            return 200, {"active": True, "today_checked_in": True}
+
+        with patch.dict(os.environ, {"WORKBUDDY_BUDGET_SECONDS": budget,
+                                    "WORKBUDDY_GROWTH_LOG_EMPTY": "1"}), \
+                patch.object(signin.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(signin, "datetime", wraps=moment) as wall, \
+                patch.object(signin, "_request", side_effect=request), \
+                patch.object(signin, "run_growth", return_value=(0, {
+                    "result": "GROWTH", "report": "idle", "credits_gained": 0, "idle": True})), \
+                patch.object(signin, "emit", side_effect=lambda out, step: outputs.append(out)):
+            wall.now.side_effect = lambda: wall_base + timedelta(seconds=clock[0] - 1000.0)
+            for round_index in range(2):
+                started = clock[0]
+                seen.clear()
+                self.assertEqual(signin._run(action), 0)
+                rows = outputs[-1]["accounts"]
+                self.assertTrue(seen, "A feasible budget must allow at least one slow account to complete")
+                self.assertTrue(any(row["result"] == "DEFERRED" for row in rows))
+                self.assertTrue(all(row["result"] in ("ALREADY", "DEFERRED") for row in rows))
+                self.assertLessEqual(clock[0] - started, float(budget) if budget else 240.0)
+                if round_index == 0:
+                    deferred = next(row["account"] for row in rows if row["result"] == "DEFERRED")
+                else:
+                    self.assertEqual(rows[0]["account"], deferred)
+
+    def test_more_accounts_than_poll_budget_capacity_still_make_progress(self):
+        self.verify_slow_rotation(10, "", "silent-poll")
+
+    def test_explicit_short_budget_runs_some_accounts_and_defers_the_rest(self):
+        self.verify_slow_rotation(3, "60", "auto")
 
 
 class RotationTests(AccountTestCase):
@@ -994,6 +1221,19 @@ class IdentityFairnessTests(AccountTestCase):
 
 
 class IdentityTieOrderTests(AccountTestCase):
+    def test_missing_uid_fallback_does_not_collide_with_another_uid(self):
+        self.bind("a", credential(uid=UID_A, token="token-a"))
+        self.bind("b", credential(uid="#name#a", token="token-b"))
+        registry = signin.load_registry()
+        registry["accounts"][0]["uid"] = ""
+        signin.save_registry(registry)
+        calls = []
+        with patch.object(signin, "run_daily", side_effect=lambda headers, endpoint: (
+                calls.append(account_token(headers)) or 0,
+                {"result": "ALREADY", "report": "ok"}, True)), patch.object(signin, "emit"):
+            self.assertEqual(signin._run("auto"), 0)
+        self.assertEqual(calls, ["token-a", "token-b"])
+
     def test_equal_run_times_preserve_registry_order_instead_of_name_order(self):
         self.bind("z", credential(uid=UID_A, token="token-z"))
         self.bind("a", credential(uid=UID_B, token="token-a"))
