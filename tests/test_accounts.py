@@ -9,6 +9,8 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -150,6 +152,80 @@ class BindTests(AccountTestCase):
                     signin.bind_account("work", source=str(path))
 
 
+class BindTransactionTests(AccountTestCase):
+    def assert_original_binding(self, registry_bytes, entry, snapshot_bytes):
+        self.assertEqual(Path(signin._registry_path()).read_bytes(), registry_bytes)
+        self.assertEqual(signin.find_account("work"), entry)
+        self.assertEqual(Path(signin.credential_path(entry)).read_bytes(), snapshot_bytes)
+        self.assertEqual(list(self.accounts_root.glob("*.info")),
+                         [Path(signin.credential_path(entry))])
+
+    def test_force_registry_failure_preserves_old_snapshot_and_manifest(self):
+        self.bind("work", credential(uid=UID_A, token="token-a"))
+        entry = signin.find_account("work")
+        original = Path(signin.credential_path(entry)).read_bytes()
+        registry_bytes = Path(signin._registry_path()).read_bytes()
+        self.write_client(credential(uid=UID_B, token="token-b"))
+        with patch.object(signin, "save_registry", side_effect=PermissionError("registry locked")):
+            with self.assertRaises(OSError):
+                signin.bind_account("work", force=True)
+        self.assert_original_binding(registry_bytes, entry, original)
+
+    @unittest.skipUnless(os.name == "nt", "Windows denies replacement of an open registry")
+    def test_real_windows_registry_lock_preserves_old_snapshot(self):
+        self.bind("work", credential(uid=UID_A, token="token-a"))
+        entry = signin.find_account("work")
+        original = Path(signin.credential_path(entry)).read_bytes()
+        registry_bytes = Path(signin._registry_path()).read_bytes()
+        self.write_client(credential(uid=UID_B, token="token-b"))
+        with open(signin._registry_path(), "rb"):
+            with self.assertRaises(OSError):
+                signin.bind_account("work", force=True)
+        self.assert_original_binding(registry_bytes, entry, original)
+
+    def test_first_bind_registry_failure_removes_unpublished_snapshot(self):
+        with patch.object(signin, "save_registry", side_effect=PermissionError("registry locked")):
+            with self.assertRaises(OSError):
+                self.bind("work")
+        self.assertEqual(signin.load_registry()["accounts"], [])
+        self.assertEqual(list(self.accounts_root.glob("*.info")), [])
+
+    def test_snapshot_write_failure_preserves_existing_binding(self):
+        self.bind("work", credential(uid=UID_A, token="token-a"))
+        entry = signin.find_account("work")
+        original = Path(signin.credential_path(entry)).read_bytes()
+        registry_bytes = Path(signin._registry_path()).read_bytes()
+        with patch.object(signin, "_atomic_write", side_effect=PermissionError("snapshot locked")):
+            with self.assertRaises(OSError):
+                self.bind("work", credential(uid=UID_B, token="token-b"), force=True)
+        self.assert_original_binding(registry_bytes, entry, original)
+
+    def test_successful_force_publishes_new_version_then_removes_old_snapshot(self):
+        self.bind("work", credential(uid=UID_A, token="token-a"))
+        original = signin.find_account("work")
+        old_path = Path(signin.credential_path(original))
+        self.bind("work", credential(uid=UID_B, token="token-b"), force=True)
+        current = signin.find_account("work")
+        self.assertNotEqual(current["credential"], original["credential"])
+        self.assertEqual(current["uid"], UID_B)
+        self.assertFalse(old_path.exists())
+        self.assertEqual(Path(signin.credential_path(current)).read_bytes(), self.client_file.read_bytes())
+
+    @unittest.skipUnless(os.name == "nt", "Windows denies deletion of an open snapshot")
+    def test_force_reports_old_snapshot_cleanup_failure_after_commit(self):
+        self.bind("work", credential(uid=UID_A, token="token-a"))
+        old = Path(signin.credential_path(signin.find_account("work")))
+        self.write_client(credential(uid=UID_B, token="token-b"))
+        with open(old, "rb"), patch.object(signin, "emit") as emit:
+            self.assertEqual(signin.main(["bind", "work", "--force"]), 1)
+        out = emit.call_args.args[0]
+        self.assertEqual(out["result"], "BOUND")
+        self.assertTrue(out["needs_attention"])
+        self.assertEqual(Path(out["credential_cleanup_path"]), old)
+        self.assertEqual(signin.find_account("work")["uid"], UID_B)
+        self.assertTrue(old.exists())
+
+
 class SwitchTests(AccountTestCase):
     def test_use_switches_active_account(self):
         self.bind_ab()
@@ -204,6 +280,115 @@ class SwitchTests(AccountTestCase):
         # 都没跑过时，当前账号先跑
         self.assertEqual([a["name"] for a in signin.order_accounts(signin.load_registry())],
                          ["b", "a"])
+
+
+class UnbindCleanupTests(AccountTestCase):
+    def setUp(self):
+        super().setUp()
+        self.bind("work", credential())
+        self.entry = signin.find_account("work")
+        self.snapshot = Path(signin.credential_path(self.entry))
+
+    def test_unavailable_snapshot_keeps_binding_for_retry(self):
+        replace = signin.os.replace
+
+        def fail_stage(source, target):
+            if Path(source) == self.snapshot:
+                raise PermissionError("snapshot locked")
+            return replace(source, target)
+
+        with patch.object(signin.os, "replace", side_effect=fail_stage), \
+                patch.object(signin, "emit") as emit:
+            self.assertEqual(signin.main(["unbind", "work"]), 1)
+        self.assertTrue(emit.call_args.args[0]["needs_attention"])
+        self.assertEqual(signin.find_account("work"), self.entry)
+        self.assertTrue(self.snapshot.exists())
+        self.assertTrue(signin.unbind_account("work")["credential_removed"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows denies moving an open snapshot")
+    def test_real_windows_snapshot_lock_can_be_retried_by_name(self):
+        with open(self.snapshot, "rb"):
+            with self.assertRaises(signin.AccountsError):
+                signin.unbind_account("work")
+        self.assertEqual(signin.find_account("work"), self.entry)
+        self.assertTrue(self.snapshot.exists())
+        self.assertTrue(signin.unbind_account("work")["credential_removed"])
+        self.assertFalse(self.snapshot.exists())
+        self.assertEqual(signin.load_registry()["accounts"], [])
+
+    def test_registry_commit_failure_restores_staged_snapshot(self):
+        original = self.snapshot.read_bytes()
+        registry_bytes = Path(signin._registry_path()).read_bytes()
+        with patch.object(signin, "save_registry", side_effect=PermissionError("registry locked")):
+            with self.assertRaises(OSError):
+                signin.unbind_account("work")
+        self.assertEqual(Path(signin._registry_path()).read_bytes(), registry_bytes)
+        self.assertEqual(signin.find_account("work"), self.entry)
+        self.assertEqual(self.snapshot.read_bytes(), original)
+        self.assertEqual(list(self.accounts_root.glob("*.info")), [self.snapshot])
+
+    @unittest.skipUnless(os.name == "nt", "Windows denies replacement of an open registry")
+    def test_real_windows_registry_lock_restores_snapshot_on_failed_unbind(self):
+        original = self.snapshot.read_bytes()
+        with open(signin._registry_path(), "rb"):
+            with self.assertRaises(OSError):
+                signin.unbind_account("work")
+        self.assertEqual(signin.find_account("work"), self.entry)
+        self.assertEqual(self.snapshot.read_bytes(), original)
+        self.assertEqual(list(self.accounts_root.glob("*.info")), [self.snapshot])
+
+    def test_process_interruption_after_staging_keeps_binding_usable_and_retryable(self):
+        child = (
+            "import os, signin\n"
+            "with signin._registry_lock():\n"
+            " entry = signin.find_account('work')\n"
+            " os.replace(signin.credential_path(entry), signin._unbind_credential_path(entry))\n"
+            " os._exit(3)\n"
+        )
+        result = subprocess.run([sys.executable, "-c", child], cwd=Path(signin.__file__).parent,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertFalse(self.snapshot.exists())
+        self.assertTrue(signin.list_accounts()["accounts"][0]["credential_exists"])
+        seen = []
+
+        def daily(headers, endpoint):
+            seen.append(account_token(headers))
+            return 0, {"result": "ALREADY", "report": "ok"}, True
+
+        with patch.object(signin, "run_daily", side_effect=daily), patch.object(signin, "emit"):
+            self.assertEqual(signin._run("auto"), 0)
+        self.assertEqual(seen, ["token-a"])
+        self.assertTrue(signin.unbind_account("work")["credential_removed"])
+        self.assertEqual(signin.load_registry()["accounts"], [])
+        self.assertEqual(list(self.accounts_root.glob("*.info")), [])
+
+    def test_final_cleanup_failure_reports_residual_path(self):
+        unlink = signin.os.unlink
+
+        def fail_cleanup(path, *args, **kwargs):
+            if Path(path).name.startswith(".unbind-"):
+                raise PermissionError("cleanup locked")
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(signin.os, "unlink", side_effect=fail_cleanup), \
+                patch.object(signin, "emit") as emit:
+            self.assertEqual(signin.main(["unbind", "work"]), 1)
+        out = emit.call_args.args[0]
+        self.assertEqual(out["result"], "UNBOUND")
+        self.assertTrue(out["needs_attention"])
+        self.assertFalse(out["credential_removed"])
+        residual = Path(out["credential_cleanup_path"])
+        self.assertTrue(residual.exists())
+        self.assertIn(str(residual), out["report"])
+        self.assertEqual(signin.load_registry()["accounts"], [])
+
+    def test_already_missing_snapshot_can_be_unbound(self):
+        self.snapshot.unlink()
+        out = signin.unbind_account("work")
+        self.assertFalse(out["credential_removed"])
+        self.assertFalse(out.get("needs_attention"))
+        self.assertEqual(signin.load_registry()["accounts"], [])
 
 
 class RegistryValidationTests(AccountTestCase):
@@ -590,9 +775,10 @@ class RegistryLockTests(AccountTestCase):
 
     def test_status_update_does_not_resurrect_unbound_entry(self):
         self.bind_ab()
+        expected = signin.find_account("a")
         with signin._registry_lock():
             thread = threading.Thread(target=signin._record_account_run,
-                                      args=("a", {"result": "ALREADY"}, 0))
+                                      args=("a", {"result": "ALREADY"}, 0, expected))
             thread.start()
             time.sleep(0.2)
             self.assertTrue(thread.is_alive(), "记录状态也要排队等锁")
@@ -602,6 +788,127 @@ class RegistryLockTests(AccountTestCase):
             signin.save_registry(registry)
         thread.join(5)
         self.assertEqual([a["name"] for a in signin.load_registry()["accounts"]], ["a"])
+
+
+class BoundIdentityExecutionTests(AccountTestCase):
+    def setUp(self):
+        super().setUp()
+        self.bind_ab()
+
+    def replace_a_with_b(self, token="token-b"):
+        path = Path(signin.credential_path(signin.find_account("a")))
+        path.write_text(json.dumps(credential(uid=UID_B, token=token)), encoding="utf-8")
+
+    def test_mismatched_fallback_is_rejected_without_blocking_b(self):
+        self.replace_a_with_b()
+        seen = []
+
+        def daily(headers, endpoint):
+            seen.append(account_token(headers))
+            return 0, {"result": "ALREADY", "report": "ok"}, True
+
+        with patch.object(signin, "run_daily", side_effect=daily), \
+                patch.object(signin, "emit") as emit:
+            self.assertEqual(signin._run("auto"), 1)
+        self.assertEqual(seen, ["token-b"])
+        rows = {row["account"]: row for row in emit.call_args.args[0]["accounts"]}
+        self.assertEqual(rows["a"]["result"], "AUTH_ERROR")
+        self.assertEqual(rows["b"]["result"], "ALREADY")
+        self.assertEqual(signin.find_account("a")["last_result"], "AUTH_ERROR")
+
+    def test_explicit_mismatch_is_rejected_before_decryption(self):
+        self.replace_a_with_b(token=envelope_token())
+        with patch.object(signin, "resolve_session") as resolve, \
+                patch.object(signin, "run_daily") as daily, \
+                patch.object(signin, "emit") as emit:
+            self.assertEqual(signin._run("auto", "a"), 1)
+        resolve.assert_not_called()
+        daily.assert_not_called()
+        self.assertEqual(emit.call_args.args[0]["reason"], "UID_MISMATCH")
+
+    def test_doctor_mismatch_is_rejected_before_runtime_probe(self):
+        self.replace_a_with_b(token=envelope_token())
+        with patch.object(signin, "run_doctor") as doctor, \
+                patch.object(signin, "emit") as emit:
+            self.assertEqual(signin._run("doctor", "a"), 1)
+        doctor.assert_not_called()
+        self.assertEqual(emit.call_args.args[0]["reason"], "UID_MISMATCH")
+
+    def test_snapshot_replaced_after_planning_is_still_rejected(self):
+        contexts, warnings = signin.credential_plan()
+        self.replace_a_with_b()
+        seen = []
+
+        def daily(headers, endpoint):
+            seen.append(account_token(headers))
+            return 0, {"result": "ALREADY", "report": "ok"}, True
+
+        with patch.object(signin, "credential_plan", return_value=(contexts, warnings)), \
+                patch.object(signin, "run_daily", side_effect=daily), \
+                patch.object(signin, "emit"):
+            self.assertEqual(signin._run("auto"), 1)
+        self.assertEqual(seen, ["token-b"])
+
+
+class RunRecordIdentityTests(AccountTestCase):
+    def test_old_success_does_not_update_rebound_identity(self):
+        self.bind("work", credential(uid=UID_A, token="token-a"))
+        replacement = self.root / "replacement.info"
+        replacement.write_text(json.dumps(credential(uid=UID_B, token="token-b")), encoding="utf-8")
+        seen = []
+
+        def daily(headers, endpoint):
+            seen.append(account_token(headers))
+            result = subprocess.run(
+                [sys.executable, signin.__file__, "bind", "work", "--from", str(replacement), "--force"],
+                capture_output=True, text=True, encoding="utf-8", timeout=10,
+                env=dict(os.environ, PYTHONIOENCODING="utf-8"))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return 0, {"result": "CLAIMED", "report": "A received 100",
+                       "credits_gained": 100}, False
+
+        with patch.object(signin, "run_daily", side_effect=daily), patch.object(signin, "emit"):
+            self.assertEqual(signin._run("auto"), 0)
+        entry = signin.find_account("work")
+        self.assertEqual(seen, ["token-a"])
+        self.assertEqual(entry["uid"], UID_B)
+        self.assertEqual(entry["last_result"], "")
+        self.assertEqual(entry["last_run_at"], "")
+
+    def test_old_failure_does_not_update_same_uid_rebound_in_same_second(self):
+        fixed = signin.datetime.fromisoformat("2026-11-13T12:00:00+08:00")
+
+        def daily(headers, endpoint):
+            self.bind("work", credential(uid=UID_A, token="token-fresh"), force=True)
+            return 1, signin._auth_failure(401), False
+
+        with patch.object(signin, "datetime", wraps=signin.datetime) as clock, \
+                patch.object(signin, "run_daily", side_effect=daily), patch.object(signin, "emit"):
+            clock.now.return_value = fixed
+            self.bind("work", credential(uid=UID_A, token="token-old"))
+            original = signin.find_account("work")
+            self.assertEqual(signin._run("auto"), 1)
+        current = signin.find_account("work")
+        self.assertEqual(current["uid"], original["uid"])
+        self.assertEqual(current["bound_at"], original["bound_at"])
+        self.assertNotEqual(current["credential"], original["credential"])
+        self.assertEqual(current["last_result"], "")
+        self.assertEqual(current["last_run_at"], "")
+
+    def test_old_run_does_not_update_unbound_then_recreated_name(self):
+        self.bind("work", credential(uid=UID_A, token="token-a"))
+
+        def daily(headers, endpoint):
+            signin.unbind_account("work")
+            self.bind("work", credential(uid=UID_B, token="token-b"))
+            return 0, {"result": "ALREADY", "report": "old A"}, True
+
+        with patch.object(signin, "run_daily", side_effect=daily), patch.object(signin, "emit"):
+            self.assertEqual(signin._run("auto"), 0)
+        current = signin.find_account("work")
+        self.assertEqual(current["uid"], UID_B)
+        self.assertEqual(current["last_result"], "")
+        self.assertEqual(current["last_run_at"], "")
 
 
 class FairnessTests(AccountTestCase):
@@ -684,6 +991,27 @@ class IdentityFairnessTests(AccountTestCase):
 
         contexts, _ = signin.credential_plan()
         self.assertEqual([c[0] for c in contexts], ["b", "fresh"])
+
+
+class IdentityTieOrderTests(AccountTestCase):
+    def test_equal_run_times_preserve_registry_order_instead_of_name_order(self):
+        self.bind("z", credential(uid=UID_A, token="token-z"))
+        self.bind("a", credential(uid=UID_B, token="token-a"))
+        registry = signin.load_registry()
+        for entry in registry["accounts"]:
+            entry["last_run_at"] = "2026-11-12T10:00:00+08:00"
+        signin.save_registry(registry)
+        self.assertEqual([c[0] for c in signin.credential_plan()[0]], ["z", "a"])
+
+    def test_equal_identity_times_ignore_unscheduled_alias_position(self):
+        self.bind("z", credential(uid=UID_A, token="token-z"))
+        self.bind("b", credential(uid=UID_B, token="token-b"))
+        self.bind("a-alias", credential(uid=UID_B, token="token-alias"), force=True)
+        registry = signin.load_registry()
+        for entry in registry["accounts"][:2]:
+            entry["last_run_at"] = "2026-11-12T10:00:00+08:00"
+        signin.save_registry(registry)
+        self.assertEqual([c[0] for c in signin.credential_plan()[0]], ["z", "a-alias"])
 
 
 class CreditAggregationTests(AccountTestCase):
@@ -781,6 +1109,36 @@ class CommandLineTests(AccountTestCase):
                      ["auto", "--force"], ["accounts", "--from", "x.info"]):
             with self.subTest(argv=argv), self.assertRaises(ValueError):
                 signin._parse_argv(argv)
+
+    def test_empty_explicit_selectors_report_error_without_running(self):
+        self.bind_ab()
+        for args in (["auto", "--account="], ["auto", "--account", ""],
+                     ["auto", "--account", " "], ["--account=", "silent"]):
+            with self.subTest(args=args), patch.object(signin, "run_daily") as daily, \
+                    patch.object(signin, "emit") as emit:
+                self.assertEqual(signin.main(args), 2)
+                daily.assert_not_called()
+                self.assertEqual(emit.call_args.args[0]["result"], "ERROR")
+
+    def test_empty_explicit_sources_do_not_create_binding(self):
+        for args in (["bind", "work", "--from="], ["bind", "work", "--from", ""],
+                     ["bind", "work", "--from", " "]):
+            with self.subTest(args=args), patch.object(signin, "find_auth_file") as find, \
+                    patch.object(signin, "emit"):
+                self.assertEqual(signin.main(args), 2)
+                find.assert_not_called()
+                self.assertEqual(signin.load_registry()["accounts"], [])
+
+    def test_direct_empty_selector_is_also_rejected(self):
+        self.bind_ab()
+        with patch.object(signin, "run_daily") as daily, patch.object(signin, "emit"):
+            self.assertEqual(signin._run("auto", ""), 1)
+        daily.assert_not_called()
+
+    def test_direct_empty_source_is_also_rejected(self):
+        with self.assertRaises(signin.AccountsError):
+            signin.bind_account("work", source="")
+        self.assertEqual(signin.load_registry()["accounts"], [])
 
     def test_main_dispatches_account_commands(self):
         stdout = io.StringIO()

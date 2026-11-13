@@ -134,6 +134,7 @@ TOKEN_LIMIT = 32768
 _sensitive_values = set()
 AUTH_REASONS = {
     "INVALID_FORMAT": "登录凭据格式无效，请检查凭据来源和客户端版本",
+    "UID_MISMATCH": "凭据与绑定账号的身份不一致，请重新登录该账号后执行 bind <账号名> --force",
     "UNSUPPORTED_ENVELOPE": "尚不支持此加密凭据格式，请更新脚本；重新登录不会改变加密格式",
     "RUNTIME_NOT_FOUND": "未找到 WorkBuddy 客户端，请用 WORKBUDDY_EXE 指定其可执行文件",
     "INVALID_RUNTIME_PATH": "WORKBUDDY_EXE 不是可用的可执行文件，请核对路径",
@@ -723,7 +724,7 @@ def load_session_retry(auth_file, attempts=3, delay=2.0):
 # 多账号：账号清单、凭据快照与轮转
 # ---------------------------------------------------------------------------
 # 桌面端同一时刻只保存一个账号的令牌，切换账号必须重新登录。所以每个账号的凭据是在
-# bind 时做的一份快照（原样复制的 *.info，令牌仍是客户端加密信封，明文从不落盘）。
+# bind 时原样复制 *.info：保留源文件的明文/加密格式，不保存运行时解密得到的明文。
 # 定时任务直接按快照依次请求，不需要、也不会去动客户端当前登录的账号。
 
 class AccountsError(Exception):
@@ -785,14 +786,9 @@ def _atomic_write(path, data, mode=0o600):
 
 
 def _credential_filename(name):
-    """凭据快照文件名只由账号名的哈希决定，与显示名称解耦。
-
-    Windows 文件名不区分大小写：直接拿账号名当文件名，"work" 和 "Work" 会共用同一份
-    快照（后绑的覆盖先绑的），解绑其中一个还会删掉另一个的文件。用大小写敏感的哈希
-    命名后，不同名字必然落到不同文件。
-    """
+    """哈希区分显示名称，独立版本确保清单提交前不会覆盖旧快照。"""
     digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:20]
-    return "acct-%s.info" % digest
+    return "acct-%s-%s.info" % (digest, uuid.uuid4().hex)
 
 
 def _acquire_registry_lock(handle, timeout):
@@ -944,8 +940,16 @@ def save_registry(registry):
                   (json.dumps(registry, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
 
+def _unbind_credential_path(entry):
+    """确定的暂存路径让解绑在移动后意外中断时仍能恢复原有凭据。"""
+    digest = hashlib.sha256(entry["credential"].encode("utf-8")).hexdigest()
+    return os.path.join(accounts_dir(), ".unbind-%s.info" % digest)
+
+
 def credential_path(entry):
-    return os.path.join(accounts_dir(), entry["credential"])
+    path = os.path.join(accounts_dir(), entry["credential"])
+    staged = _unbind_credential_path(entry)
+    return staged if not os.path.exists(path) and os.path.isfile(staged) else path
 
 
 def find_account(name):
@@ -1033,7 +1037,9 @@ def bind_account(name, source=None, force=False):
     if name.lower() in RESERVED_ACCOUNT_NAMES:
         raise AccountsError("ERROR", "「%s」是保留名：--account current/client 已经表示客户端"
                                      "当前登录，请换一个账号名" % name)
-    path = source or find_auth_file()[0]
+    if source is not None and not os.fspath(source).strip():
+        raise AccountsError("ERROR", "--from 的凭据文件路径不能为空")
+    path = source if source is not None else find_auth_file()[0]
     if not path:
         raise AccountsError("NO_AUTH", "未找到当前登录凭据，请先登录 WorkBuddy 桌面端，"
                                        "或用 --from 指定凭据文件")
@@ -1058,6 +1064,7 @@ def bind_account(name, source=None, force=False):
     credential = _credential_filename(name)
     target = os.path.join(accounts_dir(), credential)
     target_key = os.path.normcase(os.path.abspath(target))
+    cleanup_path = None
     with _registry_lock():
         registry = load_registry()
         previous = None
@@ -1081,13 +1088,25 @@ def bind_account(name, source=None, force=False):
         entry = {"name": name, "uid": uid, "endpoint": endpoint, "credential": credential,
                  "bound_at": datetime.now().astimezone().isoformat(timespec="seconds"),
                  "last_run_at": "", "last_result": "", "last_code": 0}
-        _atomic_write(target, raw)
-        accounts = [a for a in registry["accounts"] if a["name"] != name]
-        accounts.append(entry)
-        registry["accounts"] = accounts
-        if not registry.get("active"):
-            registry["active"] = name
-        save_registry(registry)
+        # 发布新版本的引用后才能删除旧快照；清单提交失败时旧引用/内容保持不变。
+        try:
+            _atomic_write(target, raw)
+            accounts = [entry if a["name"] == name else a for a in registry["accounts"]]
+            if previous is None:
+                accounts.append(entry)
+            registry["accounts"] = accounts
+            if not registry.get("active"):
+                registry["active"] = name
+            save_registry(registry)
+        except Exception:
+            try:
+                os.unlink(target)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise AccountsError("ERROR", "绑定未提交，原有账号未更新；新凭据清理失败，"
+                                    "请解除文件占用后删除：%s" % target) from None
+            raise
 
         # 旧版本用账号名直接做文件名，--force 更新后会留下没人引用的旧快照（含令牌）。
         stale = credential_path(previous) if previous else None
@@ -1100,15 +1119,21 @@ def bind_account(name, source=None, force=False):
         if stale:
             try:
                 os.unlink(stale)
-            except OSError:
+            except FileNotFoundError:
                 pass
+            except OSError:
+                cleanup_path = stale
 
-    return {"account": name, "uid": _uid_hint(uid), "endpoint": endpoint,
-            "credential": target,
-            "active": registry["active"],
-            "report": "已绑定账号「%s」（uid %s），当前共 %d 个账号%s" % (
-                name, _uid_hint(uid) or "-", len(accounts),
-                "；当前账号是「%s」" % registry["active"] if registry["active"] else "")}
+    out = {"account": name, "uid": _uid_hint(uid), "endpoint": endpoint,
+           "credential": target,
+           "active": registry["active"],
+           "report": "已绑定账号「%s」（uid %s），当前共 %d 个账号%s" % (
+               name, _uid_hint(uid) or "-", len(accounts),
+               "；当前账号是「%s」" % registry["active"] if registry["active"] else "")}
+    if cleanup_path:
+        out.update(needs_attention=True, credential_cleanup_path=cleanup_path)
+        out["report"] += "；绑定已更新，但旧凭据未能删除，请解除文件占用后删除：%s" % cleanup_path
+    return out
 
 
 def use_account(name):
@@ -1134,20 +1159,48 @@ def unbind_account(name):
         registry["accounts"] = [a for a in registry["accounts"] if a["name"] != name]
         if registry.get("active") == name:
             registry["active"] = registry["accounts"][0]["name"] if registry["accounts"] else None
-        save_registry(registry)
         removed = False
         path = credential_path(entry)
         path_key = os.path.normcase(os.path.abspath(path))
         shared = any(os.path.normcase(os.path.abspath(credential_path(a))) == path_key
                      for a in registry["accounts"])
+        staged = None
         if not shared:
+            staged = _unbind_credential_path(entry)
             try:
-                os.unlink(path)
+                # 先移动快照：文件被占用时保留绑定，用户可按同一名称重试。
+                if path != staged:
+                    os.replace(path, staged)
+            except FileNotFoundError:
+                staged = None
+            except OSError:
+                raise AccountsError("ERROR", "凭据副本暂时无法移除，账号仍绑定；请解除文件占用后"
+                                    "重试 signin.py unbind %s" % name) from None
+        try:
+            save_registry(registry)
+        except Exception:
+            if staged:
+                try:
+                    os.replace(staged, path)
+                except OSError:
+                    raise AccountsError("ERROR", "解绑未提交，凭据保留在 %s；请恢复到 %s 后重试"
+                                        % (staged, path)) from None
+            raise
+        cleanup_path = None
+        if staged:
+            try:
+                os.unlink(staged)
+                removed = True
+            except FileNotFoundError:
                 removed = True
             except OSError:
-                pass
-    return {"account": name, "credential_removed": removed, "active": registry.get("active"),
-            "report": "已解绑账号「%s」，还剩 %d 个账号" % (name, len(registry["accounts"]))}
+                cleanup_path = staged
+    out = {"account": name, "credential_removed": removed, "active": registry.get("active"),
+           "report": "已解绑账号「%s」，还剩 %d 个账号" % (name, len(registry["accounts"]))}
+    if cleanup_path:
+        out.update(needs_attention=True, credential_cleanup_path=cleanup_path)
+        out["report"] += "；凭据未能删除，请解除文件占用后删除：%s" % cleanup_path
+    return out
 
 
 def _credential_expiry_text(path):
@@ -1205,7 +1258,9 @@ def credential_plan(explicit=None, rotate=True):
     explicit 取 "current"/"client" 表示忽略清单、只用客户端当前登录。
     """
     warnings = []
-    if explicit:
+    if explicit is not None:
+        if not isinstance(explicit, str) or not explicit.strip():
+            raise AccountsError("ERROR", "--account 的账号名不能为空")
         if explicit.strip().lower() in ("current", "client"):
             path, _ = find_auth_file()
             if not path:
@@ -1231,7 +1286,7 @@ def credential_plan(explicit=None, rotate=True):
             raise _missing_auth_error()
         return [(None, path, None)], warnings
 
-    entries = order_accounts(registry)
+    entries = registry["accounts"]
     if not rotate:
         active = registry.get("active")
         entries = [a for a in entries if a["name"] == active][:1] or entries[:1]
@@ -1250,15 +1305,14 @@ def credential_plan(explicit=None, rotate=True):
         active = registry.get("active")
         # 相同时间的并列用清单顺序兜底，而不是字母序：否则同一秒里跑完的身份会被
         # 名字顺序重新排一遍，短预算下仍可能让某个身份一直排后面。
-        ordered_groups = [group for _, group in sorted(
-            enumerate(ordered_groups),
-            key=lambda item: _identity_sort_key(item[1], active) + (item[0],))]
+        ordered_groups = sorted(ordered_groups, key=lambda group: _identity_sort_key(group, active))
 
     contexts = []
     for group in ordered_groups:
         chosen = None
         fallback = None
-        for entry in group:
+        # 组间并列保留原始清单顺序，组内仍按原有快照优先级选凭据。
+        for entry in order_accounts({"accounts": group, "active": registry.get("active")}):
             path, usable = _snapshot_state(entry)
             if fallback is None:
                 fallback = (entry, path)
@@ -1274,9 +1328,9 @@ def credential_plan(explicit=None, rotate=True):
     return contexts, warnings
 
 
-def _record_account_run(name, out, code):
+def _record_account_run(name, out, code, expected):
     """把本次结果记回清单，供下一次轮转排序与 accounts 展示；失败不影响主流程。"""
-    if not name:
+    if not name or expected is None:
         return
     # 用短超时：定时任务不该为了记一行状态而卡住整轮预算。
     try:
@@ -1284,6 +1338,10 @@ def _record_account_run(name, out, code):
             registry = load_registry()
             for entry in registry["accounts"]:
                 if entry["name"] == name:
+                    # 同名重绑（包括同 UID 在同一秒重绑）不能继承旧请求的结果。
+                    if any(entry.get(field) != expected.get(field)
+                           for field in ("uid", "credential", "bound_at")):
+                        return
                     entry["last_run_at"] = datetime.now().astimezone().isoformat(
                         timespec="seconds")
                     entry["last_result"] = str(out.get("result") or "UNKNOWN")[:64]
@@ -2425,6 +2483,10 @@ def _parse_argv(argv):
         index += 1
 
     action = positional[0] if positional else "auto"
+    if account is not None and not account.strip():
+        raise ValueError("--account 需要一个非空账号名")
+    if source is not None and not source.strip():
+        raise ValueError("--from 需要一个非空凭据文件路径")
     name = account
     if action in ACCOUNT_ACTIONS:
         if len(positional) > 1:
@@ -2435,7 +2497,7 @@ def _parse_argv(argv):
         raise ValueError("参数过多：%s" % " ".join(positional[1:]))
     if force and action != "bind":
         raise ValueError("--force 只用于 bind")
-    if source and action != "bind":
+    if source is not None and action != "bind":
         raise ValueError("--from 只用于 bind")
     return action, name, source, force
 
@@ -2486,7 +2548,7 @@ def _run_account_command(action, name, source, force):
         emit(e.output(), action)
         return 2 if e.result == "NO_AUTH" else 1
     emit(out, action)
-    return 0
+    return 1 if out.get("needs_attention") else 0
 
 
 def _dispatch(action, headers, endpoint):
@@ -2540,7 +2602,7 @@ def _dispatch(action, headers, endpoint):
     return 0, {"result": "OK"}, False, steps
 
 
-def _run_one_account(action, auth_file, label=None):
+def _run_one_account(action, auth_file, label=None, entry=None):
     """跑单个账号的凭据；返回 (code, out, quiet, steps)，所有异常都转成可汇报结果。"""
     if auth_file is None:
         return 1, {"result": "MISSING", "needs_attention": True,
@@ -2564,6 +2626,9 @@ def _run_one_account(action, auth_file, label=None):
                              % (type(e).__name__, e)}, False, []
 
     try:
+        _validate_session(session)
+        if entry and entry.get("uid") and session["account"]["uid"] != entry["uid"]:
+            raise AuthError("UID_MISMATCH")
         if action == "doctor":
             return 0, run_doctor(session), False, []
         expired = _session_expired(session)
@@ -2598,7 +2663,7 @@ def _run_rotation(action, contexts, warnings):
     quiet_all = True
     credits = 0
     total_state = _budget_snapshot()
-    for index, (label, path, _) in enumerate(contexts):
+    for index, (label, path, entry) in enumerate(contexts):
         remaining = _budget_left()
         if remaining < ACCOUNT_MIN_SLICE:
             for rest_label, _, _ in contexts[index:]:
@@ -2608,7 +2673,7 @@ def _run_rotation(action, contexts, warnings):
             break
         _budget_slice(remaining / (total - index))
         try:
-            code, out, quiet, _ = _run_one_account(action, path, label)
+            code, out, quiet, _ = _run_one_account(action, path, label, entry)
         except Exception as e:
             # 一个账号的意外异常绝不能带走其余账号——"切到下一个账号"正是这个功能的意义。
             code, quiet = 2, False
@@ -2625,7 +2690,7 @@ def _run_rotation(action, contexts, warnings):
         if out.get("uid_hint"):
             row["uid"] = out["uid_hint"]
         results.append(row)
-        _record_account_run(label, out, code)
+        _record_account_run(label, out, code, entry)
 
     out = {"result": "ALL", "total": total, "accounts": results, "credits_gained": credits,
            "needs_attention": overall != 0,
@@ -2680,9 +2745,9 @@ def _run(action, account=None, source=None, force=False):
         _start_budget(action, len(contexts))
         return _run_rotation(action, contexts, warnings)
 
-    label, path, _ = contexts[0]
-    code, out, quiet, steps = _run_one_account(action, path, label)
-    _record_account_run(label, out, code)
+    label, path, entry = contexts[0]
+    code, out, quiet, steps = _run_one_account(action, path, label, entry)
+    _record_account_run(label, out, code, entry)
     if label:
         out.setdefault("account", label)
     if warnings:
