@@ -31,9 +31,23 @@ WORKBUDDY_AUTH_FILE 指定。任何模式下都不会打印令牌，可安全分
   python signin.py status         # 仅查签到状态（调试）
   python signin.py claim          # 仅领取签到（调试，幂等）
   python signin.py all            # 查签到状态 + 领取（调试）
+
+多账号（一个账号跑完自动切下一个）：
+  python signin.py bind work      # 把客户端当前登录的账号绑定为 work（登录另一个账号后可再 bind 一个）
+  python signin.py accounts       # 查看已绑定账号、当前账号与各自最近一次结果
+  python signin.py use work       # 切换当前账号（单账号命令默认用它）
+  python signin.py unbind work    # 解绑（同时删除该账号的凭据副本）
+  python signin.py auto --account work      # 只跑 work
+  python signin.py auto --account current   # 只跑客户端当前登录账号（忽略账号清单）
+
+绑定了多个账号后，auto / silent / growth / silent-poll / silent-growth 会按"一个账号跑完
+再切下一个"的顺序依次处理全部账号，任一账号失败都不会中断其余账号。桌面端同一时间只能
+登录一个账号，所以每个账号的凭据是在 bind 时做的快照；要更新某个账号的凭据（重新登录后），
+再执行一次 bind <名字> --force。
 """
 
 import base64
+import hashlib
 import json
 import math
 import ntpath
@@ -43,13 +57,14 @@ import re
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
 import urllib.parse
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import date, datetime
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
@@ -94,6 +109,24 @@ _config_warning = None   # 配置非法时的告警，由 emit 统一带进输�
 # 已安装的计划任务还在用它，必须继续认。
 POLL_ACTIONS = ("silent-poll", "silent-growth")
 
+# ---- 多账号 ----
+# 账号清单与凭据副本默认放在脚本同目录的 accounts/ 下（可用 WORKBUDDY_ACCOUNTS_DIR 覆盖）。
+# 桌面端同一时刻只保存一个账号的令牌，所以每个账号的凭据是 bind 时的快照；脚本按快照
+# 依次请求，不需要真的在客户端里来回切登录。
+ACCOUNTS_DIRNAME = "accounts"
+ACCOUNTS_REGISTRY_NAME = "accounts.json"
+ACCOUNTS_VERSION = 1
+# 账号名会用于生成凭据副本文件名，只放行"中英文/数字/点/下划线/短横线"，且首字符不能是
+# 符号：这样 "."、".."、"-x"（会被当成命令行参数）这类名字在入口就被挡掉。
+ACCOUNT_NAME_RE = re.compile(r"[0-9A-Za-z\u4e00-\u9fff][0-9A-Za-z\u4e00-\u9fff._-]{0,31}")
+# 这些名字与 --account 的选择器语义冲突（current/client = 客户端当前登录），不允许绑定。
+RESERVED_ACCOUNT_NAMES = ("current", "client")
+# 剩余预算不足以再跑完一个账号时，宁可把它留给下一轮，也不要跑到一半被任务时限强杀。
+ACCOUNT_MIN_SLICE = 30.0
+# 清单读改写由跨进程锁保护；等锁超时说明另一个实例卡住了，直接报错而不是无限等待。
+REGISTRY_LOCK_TIMEOUT = 15.0
+REGISTRY_LOCK_NAME = ".registry.lock"
+
 AUTH_HELPER_TIMEOUT = 10.0
 AUTH_INPUT_LIMIT = 65536
 AUTH_OUTPUT_LIMIT = 65536
@@ -101,6 +134,7 @@ TOKEN_LIMIT = 32768
 _sensitive_values = set()
 AUTH_REASONS = {
     "INVALID_FORMAT": "登录凭据格式无效，请检查凭据来源和客户端版本",
+    "UID_MISMATCH": "凭据与绑定账号的身份不一致，请重新登录该账号后执行 bind <账号名> --force",
     "UNSUPPORTED_ENVELOPE": "尚不支持此加密凭据格式，请更新脚本；重新登录不会改变加密格式",
     "RUNTIME_NOT_FOUND": "未找到 WorkBuddy 客户端，请用 WORKBUDDY_EXE 指定其可执行文件",
     "INVALID_RUNTIME_PATH": "WORKBUDDY_EXE 不是可用的可执行文件，请核对路径",
@@ -575,17 +609,23 @@ def _parse_budget(default=DEFAULT_BUDGET_SECONDS, maximum=MAX_BUDGET_SECONDS):
     return val, None
 
 
-def _start_budget(action=None):
+def _start_budget(action=None, accounts=1):
     """启动预算时钟；配置非法时记下告警，由 emit 带进输出而不是静默回落。
 
     轮询类命令（silent-poll / silent-growth）用更短的默认值和更低的上限，用户显式设置
     环境变量时仍以环境变量为准，但同样夹在该命令自己的上限内。
+
+    accounts > 1 时把默认值抬到"每个账号至少 ACCOUNT_MIN_SLICE 秒"，否则 6 个账号
+    分 180 秒每人才 30 秒，连一次冷启动重试都跑不完。上限仍是任务时限，不会被抬穿。
     """
     global _started_at, _budget_seconds, _config_warning
     if action in POLL_ACTIONS:
         default, maximum = POLL_BUDGET_SECONDS, POLL_MAX_BUDGET_SECONDS
     else:
         default, maximum = DEFAULT_BUDGET_SECONDS, MAX_BUDGET_SECONDS
+    count = max(1, int(accounts or 1))
+    if count > 1:
+        default = max(default, min(maximum, ACCOUNT_MIN_SLICE * count))
     _budget_seconds, _config_warning = _parse_budget(default, maximum)
     _started_at = time.monotonic()
 
@@ -595,6 +635,26 @@ def _budget_left():
     if _started_at is None:
         return _budget_seconds
     return _budget_seconds - (time.monotonic() - _started_at)
+
+
+def _budget_snapshot():
+    return _started_at, _budget_seconds
+
+
+def _budget_restore(snapshot):
+    global _started_at, _budget_seconds
+    _started_at, _budget_seconds = snapshot
+
+
+def _budget_slice(seconds):
+    """把当前预算换成"某个账号的时间片"，退出时由 _budget_restore 还原总预算。
+
+    多账号轮转必须在同一份总预算内切分：每个账号看到的 _budget_left() 是它自己的
+    时间片，这样内部所有"预算耗尽就跳过"的判断无需改动，而账号之间不会互相透支。
+    """
+    global _started_at, _budget_seconds
+    _started_at = time.monotonic()
+    _budget_seconds = max(0.0, float(seconds))
 
 
 def find_auth_file():
@@ -623,18 +683,32 @@ def find_auth_file():
     return None, candidates
 
 
+def read_credential_bytes(auth_file, attempts=3, delay=2.0):
+    """读取凭据文件原始字节（bind 要原样复制，不能边读边解析）。
+
+    WorkBuddy 客户端刷新 token 时会短暂独占凭据文件，恰好在那一刻读取就是
+    PermissionError（实测：定时任务两次撞锁、整轮直接放弃）。锁是瞬时的，
+    等两秒再试即可；重试仍失败才真正报错。
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            with open(auth_file, "rb") as f:
+                return f.read()
+        except PermissionError as e:
+            last = e
+            if i < attempts - 1:
+                time.sleep(delay)
+    raise last
+
+
 def load_session(auth_file):
     with open(auth_file, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def load_session_retry(auth_file, attempts=3, delay=2.0):
-    """带重试的凭据读取。
-
-    WorkBuddy 客户端刷新 token 时会短暂独占凭据文件，恰好在那一刻读取就是
-    PermissionError（实测：定时任务两次撞锁、整轮直接放弃）。锁是瞬时的，
-    等两秒再试即可；重试仍失败才真正报错。
-    """
+    """带重试的凭据读取；重试策略与 read_credential_bytes 一致。"""
     last = None
     for i in range(attempts):
         try:
@@ -644,6 +718,646 @@ def load_session_retry(auth_file, attempts=3, delay=2.0):
             if i < attempts - 1:
                 time.sleep(delay)
     raise last
+
+
+# ---------------------------------------------------------------------------
+# 多账号：账号清单、凭据快照与轮转
+# ---------------------------------------------------------------------------
+# 桌面端同一时刻只保存一个账号的令牌，切换账号必须重新登录。所以每个账号的凭据是在
+# bind 时原样复制 *.info：保留源文件的明文/加密格式，不保存运行时解密得到的明文。
+# 定时任务直接按快照依次请求，不需要、也不会去动客户端当前登录的账号。
+
+class AccountsError(Exception):
+    """账号管理相关的固定错误；消息里绝不带令牌。"""
+
+    def __init__(self, result, report, **extra):
+        self.result = result
+        self.report = report
+        self.extra = extra
+        super().__init__(report)
+
+    def output(self):
+        out = {"result": self.result, "report": self.report, "needs_attention": True}
+        out.update(self.extra)
+        return out
+
+
+def accounts_dir():
+    """账号清单目录：WORKBUDDY_ACCOUNTS_DIR 优先，否则脚本同目录的 accounts/。"""
+    override = (os.environ.get("WORKBUDDY_ACCOUNTS_DIR") or "").strip()
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), ACCOUNTS_DIRNAME)
+
+
+def _registry_path():
+    return os.path.join(accounts_dir(), ACCOUNTS_REGISTRY_NAME)
+
+
+def _empty_registry():
+    return {"version": ACCOUNTS_VERSION, "active": None, "accounts": []}
+
+
+def _valid_account_name(name):
+    return isinstance(name, str) and ACCOUNT_NAME_RE.fullmatch(name) is not None
+
+
+def _atomic_write(path, data, mode=0o600):
+    """原子写文件：先写同目录临时文件再 os.replace，避免中断留下半截 JSON。"""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chmod(tmp, mode)   # Windows 上基本无效；POSIX 上确保 0600
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _credential_filename(name):
+    """哈希区分显示名称，独立版本确保清单提交前不会覆盖旧快照。"""
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:20]
+    return "acct-%s-%s.info" % (digest, uuid.uuid4().hex)
+
+
+def _acquire_registry_lock(handle, timeout):
+    """尝试获取清单锁；拿不到就短睡重试，超时抛 AccountsError。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise AccountsError("ERROR", "账号清单正被另一个进程占用，请稍后重试")
+            time.sleep(0.05)
+
+
+def _release_registry_lock(handle):
+    try:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _registry_lock(timeout=REGISTRY_LOCK_TIMEOUT):
+    """保护清单的完整读改写；os.replace 只保证单次替换完整，挡不住并发丢更新。
+
+    账号管理命令与定时任务可能同时运行：_record_account_run 若读到旧清单后再写回，
+    期间完成的 unbind 会被复活（条目还在、快照已删）。所以所有 load→修改→save 都
+    必须在同一把跨进程锁里完成。
+    """
+    directory = accounts_dir()
+    os.makedirs(directory, exist_ok=True)
+    handle = open(os.path.join(directory, REGISTRY_LOCK_NAME), "a+b")
+    try:
+        _acquire_registry_lock(handle, timeout)
+        try:
+            yield
+        finally:
+            _release_registry_lock(handle)
+    finally:
+        handle.close()
+
+
+def _snapshot_state(entry):
+    """返回 (path, usable)：文件存在、凭据结构/令牌格式合法且未过期才算可用。
+
+    选择阶段只做本地格式检查（_validate_session + _token_format），不解密、不联网：
+    受支持的加密信封仍然算可用。能解析 JSON 但缺少 auth/account、令牌格式非法，
+    或快照里的 UID 与清单记录对不上，都不能算"可用"。
+    """
+    path = credential_path(entry)
+    if not os.path.exists(path):
+        return path, False
+    try:
+        session = load_session(path)
+        _validate_session(session)
+        _token_format(session["auth"]["accessToken"])
+    except (OSError, ValueError, UnicodeError, AuthError):
+        return path, False
+    if entry.get("uid") and session["account"].get("uid") != entry["uid"]:
+        return path, False
+    return path, _session_expired(session) is None
+
+
+def _account_entry(item):
+    """校验清单里的单条记录；任何结构问题都当作清单损坏，绝不猜。"""
+    if not isinstance(item, dict):
+        raise AccountsError("ERROR", "账号清单格式无效（记录不是对象）")
+    name = item.get("name")
+    if not _valid_account_name(name):
+        raise AccountsError("ERROR", "账号清单里有无效的账号名（应为合法名称字符串）")
+    credential = item.get("credential")
+    if (not isinstance(credential, str) or not credential
+            or os.path.basename(credential) != credential or credential in (".", "..")
+            or "\\" in credential or ":" in credential
+            or credential.rstrip(" .").casefold() in
+            (ACCOUNTS_REGISTRY_NAME.casefold(), REGISTRY_LOCK_NAME.casefold())):
+        raise AccountsError("ERROR", "账号「%s」的凭据文件名无效" % name)
+
+    def text(field, limit):
+        value = item.get(field)
+        if value in (None, ""):
+            return ""
+        if (not isinstance(value, str) or len(value) > limit
+                or re.search(r"[\x00-\x1f\x7f]", value)):
+            raise AccountsError("ERROR", "账号「%s」的字段 %s 无效" % (name, field))
+        return value
+
+    return {"name": name, "uid": text("uid", 256), "endpoint": text("endpoint", 2048),
+            "credential": credential, "bound_at": text("bound_at", 64),
+            "last_run_at": text("last_run_at", 64), "last_result": text("last_result", 64),
+            "last_code": as_int(item.get("last_code"), 0)}
+
+
+def _registry_from(data):
+    if not isinstance(data, dict):
+        raise AccountsError("ERROR", "账号清单格式无效（不是 JSON 对象）")
+    version = data.get("version")
+    if type(version) is not int or version != ACCOUNTS_VERSION:
+        raise AccountsError("ERROR", "账号清单版本不受支持（应为受支持的整数版本），"
+                            "请修复清单后重试")
+    raw = data.get("accounts", [])
+    if not isinstance(raw, list):
+        raise AccountsError("ERROR", "账号清单格式无效（accounts 不是数组）")
+    entries = []
+    names = set()
+    for item in raw:
+        entry = _account_entry(item)
+        if entry["name"] in names:
+            raise AccountsError("ERROR", "账号清单里有重复的账号名「%s」" % entry["name"])
+        names.add(entry["name"])
+        entries.append(entry)
+    active = data.get("active")
+    # active 必须是账号名或 null：数组/对象会让 `active not in names` 抛 TypeError，
+    # 那会绕过 credential_plan 的 AccountsError 回退，让整轮签到直接退出。
+    if active is not None and not isinstance(active, str):
+        raise AccountsError("ERROR", "账号清单的 active 字段无效（应为账号名或 null）")
+    if active not in names:
+        active = entries[0]["name"] if entries else None
+    return {"version": ACCOUNTS_VERSION, "active": active, "accounts": entries}
+
+
+def load_registry():
+    """读账号清单；文件不存在视为"还没绑定账号"，内容损坏则明确报错。"""
+    path = _registry_path()
+    if not os.path.exists(path):
+        return _empty_registry()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise AccountsError("ERROR", "账号清单读取失败（%s: %s），请修复或删除 %s"
+                            % (type(e).__name__, e, path)) from None
+    return _registry_from(data)
+
+
+def save_registry(registry):
+    registry = _registry_from(registry)
+    _atomic_write(_registry_path(),
+                  (json.dumps(registry, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+
+def _unbind_credential_path(entry):
+    """确定的暂存路径让解绑在移动后意外中断时仍能恢复原有凭据。"""
+    digest = hashlib.sha256(entry["credential"].encode("utf-8")).hexdigest()
+    return os.path.join(accounts_dir(), ".unbind-%s.info" % digest)
+
+
+def credential_path(entry):
+    path = os.path.join(accounts_dir(), entry["credential"])
+    staged = _unbind_credential_path(entry)
+    return staged if not os.path.exists(path) and os.path.isfile(staged) else path
+
+
+def find_account(name):
+    registry = load_registry()
+    for entry in registry["accounts"]:
+        if entry["name"] == name:
+            return entry
+    raise AccountsError("ERROR", "未绑定账号「%s」；用 signin.py accounts 查看已绑定账号" % name)
+
+
+def _uid_hint(uid):
+    """对外展示只给 uid 前缀：够区分账号，又不把完整身份标识写进日志。"""
+    return (uid[:8] + "…") if uid else ""
+
+
+def order_accounts(registry):
+    """轮转顺序：按"上次运行时间"从早到晚，没跑过的优先。
+
+    这样被 DEFERRED 的账号（这一轮没轮到、last_run_at 没更新）下一轮自然排到最前面，
+    连续多轮预算不足时也不会永远只跑同一个账号。只有在还没跑过的账号之间才让当前
+    账号优先，保证首次轮转符合使用者的预期。
+
+    last_run_at 是 ISO 时间串，同一格式下字典序即时间序。
+    """
+    active = registry.get("active")
+
+    def sort_key(account):
+        stamp = account.get("last_run_at") or ""
+        # 没跑过的账号里，当前账号排最前；一旦跑过就只按时间排。
+        return (stamp, 0 if (not stamp and account["name"] == active) else 1, account["name"])
+
+    return sorted(registry["accounts"], key=sort_key)
+
+
+def _identity_sort_key(group, active):
+    """一个登录身份（同 uid 的多份快照）的轮转排序键。
+
+    取组内所有快照 last_run_at 的最大值：只要这个身份跑过（不管这一轮实际执行的是
+    哪一份快照），它就不该继续靠"过期别名的空时间"排在最前面。只有整个身份从未运行
+    过时，才让当前账号优先。这样既兼容既有清单里的历史记录，也不需要把没执行的
+    过期别名标成成功。
+    """
+    last = max((account.get("last_run_at") or "" for account in group), default="")
+    is_active = any(account["name"] == active for account in group)
+    return (last, 0 if (not last and is_active) else 1)
+
+
+def _expires_text(value):
+    try:
+        stamp = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if not math.isfinite(stamp) or stamp <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(stamp / 1000.0).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _session_expired(session):
+    """凭据快照是否已过期；过期返回展示用时间串，未过期/无法判断返回 None。
+
+    快照里的 expiresAt 是客户端上次刷新时写下的，过了这个时间令牌必然失效，
+    提前判掉可以省掉一次注定 401 的请求，也能把"该重新登录哪个账号"说清楚。
+    """
+    auth = session.get("auth") if isinstance(session, dict) else None
+    if not isinstance(auth, dict):
+        return None
+    text = _expires_text(auth.get("expiresAt"))
+    try:
+        expires = float(auth.get("expiresAt"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if text and math.isfinite(expires) and expires <= time.time() * 1000:
+        return text
+    return None
+
+
+def bind_account(name, source=None, force=False):
+    """把一份登录凭据绑定为账号快照；返回可汇报的摘要（绝不含令牌）。"""
+    if not _valid_account_name(name):
+        raise AccountsError("ERROR", "账号名无效：只能用中英文、数字、点、下划线、短横线，"
+                                     "1-32 个字符，且不能以符号开头")
+    if name.lower() in RESERVED_ACCOUNT_NAMES:
+        raise AccountsError("ERROR", "「%s」是保留名：--account current/client 已经表示客户端"
+                                     "当前登录，请换一个账号名" % name)
+    if source is not None and not os.fspath(source).strip():
+        raise AccountsError("ERROR", "--from 的凭据文件路径不能为空")
+    path = source if source is not None else find_auth_file()[0]
+    if not path:
+        raise AccountsError("NO_AUTH", "未找到当前登录凭据，请先登录 WorkBuddy 桌面端，"
+                                       "或用 --from 指定凭据文件")
+    if not os.path.isfile(path):
+        raise AccountsError("NO_AUTH", "凭据文件不存在：%s" % path)
+    try:
+        raw = read_credential_bytes(path)
+    except OSError as e:
+        raise AccountsError("ERROR", "读取凭据文件失败（%s），请确认客户端没有独占锁定该文件"
+                            % type(e).__name__) from None
+    try:
+        session = json.loads(raw.decode("utf-8"))
+        _validate_session(session)
+        _token_format(session["auth"]["accessToken"])
+    except AuthError as e:
+        raise AccountsError("ERROR", "这份凭据不能用来绑定账号：%s" % e) from None
+    except (ValueError, UnicodeError):
+        raise AccountsError("ERROR", "凭据文件不是合法 JSON：%s" % path) from None
+
+    uid = session["account"]["uid"]
+    endpoint = ((session.get("auth") or {}).get("endpoint") or DEFAULT_ENDPOINT).rstrip("/")
+    credential = _credential_filename(name)
+    target = os.path.join(accounts_dir(), credential)
+    target_key = os.path.normcase(os.path.abspath(target))
+    cleanup_path = None
+    with _registry_lock():
+        registry = load_registry()
+        previous = None
+        for other in registry["accounts"]:
+            if other["name"] == name:
+                previous = other
+                if not force:
+                    raise AccountsError("ERROR", "账号「%s」已绑定；要更新凭据请加 --force" % name)
+            elif other["name"].lower() == name.lower() and not force:
+                # Windows 上 work / Work 在列表里几乎无法分辨，未加 --force 时拒绝。
+                raise AccountsError("ERROR", "已有账号「%s」与「%s」只差大小写；"
+                                             "确实要同时保留请加 --force" % (other["name"], name))
+            elif other["uid"] == uid and not force:
+                raise AccountsError("ERROR", "该登录账号已绑定为「%s」；如需重复绑定请加 --force"
+                                    % other["name"])
+            if other["name"] != name and \
+                    os.path.normcase(os.path.abspath(credential_path(other))) == target_key:
+                raise AccountsError("ERROR", "账号「%s」的凭据文件与新账号冲突，请先解绑它"
+                                    % other["name"])
+
+        entry = _account_entry({
+            "name": name, "uid": uid, "endpoint": endpoint, "credential": credential,
+            "bound_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "last_run_at": "", "last_result": "", "last_code": 0})
+        # 发布新版本的引用后才能删除旧快照；清单提交失败时旧引用/内容保持不变。
+        try:
+            _atomic_write(target, raw)
+            accounts = [entry if a["name"] == name else a for a in registry["accounts"]]
+            if previous is None:
+                accounts.append(entry)
+            registry["accounts"] = accounts
+            if not registry.get("active"):
+                registry["active"] = name
+            save_registry(registry)
+        except Exception:
+            try:
+                os.unlink(target)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise AccountsError("ERROR", "绑定未提交，原有账号未更新；新凭据清理失败，"
+                                    "请解除文件占用后删除：%s" % target) from None
+            raise
+
+        # 旧版本用账号名直接做文件名，--force 更新后会留下没人引用的旧快照（含令牌）。
+        stale = credential_path(previous) if previous else None
+        if stale:
+            stale_key = os.path.normcase(os.path.abspath(stale))
+            if stale_key == target_key or any(
+                    os.path.normcase(os.path.abspath(credential_path(a))) == stale_key
+                    for a in registry["accounts"]):
+                stale = None
+        if stale:
+            try:
+                os.unlink(stale)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                cleanup_path = stale
+
+    out = {"account": name, "uid": _uid_hint(uid), "endpoint": endpoint,
+           "credential": target,
+           "active": registry["active"],
+           "report": "已绑定账号「%s」（uid %s），当前共 %d 个账号%s" % (
+               name, _uid_hint(uid) or "-", len(accounts),
+               "；当前账号是「%s」" % registry["active"] if registry["active"] else "")}
+    if cleanup_path:
+        out.update(needs_attention=True, credential_cleanup_path=cleanup_path)
+        out["report"] += "；绑定已更新，但旧凭据未能删除，请解除文件占用后删除：%s" % cleanup_path
+    return out
+
+
+def use_account(name):
+    with _registry_lock():
+        registry = load_registry()
+        entry = next((a for a in registry["accounts"] if a["name"] == name), None)
+        if entry is None:
+            raise AccountsError("ERROR", "未绑定账号「%s」；用 signin.py accounts 查看已绑定账号"
+                                % name)
+        registry["active"] = name
+        save_registry(registry)
+    return {"account": name, "uid": _uid_hint(entry["uid"]), "active": name,
+            "report": "当前账号已切换为「%s」" % name}
+
+
+def unbind_account(name):
+    with _registry_lock():
+        registry = load_registry()
+        entry = next((a for a in registry["accounts"] if a["name"] == name), None)
+        if entry is None:
+            raise AccountsError("ERROR", "未绑定账号「%s」；用 signin.py accounts 查看已绑定账号"
+                                % name)
+        registry["accounts"] = [a for a in registry["accounts"] if a["name"] != name]
+        if registry.get("active") == name:
+            registry["active"] = registry["accounts"][0]["name"] if registry["accounts"] else None
+        removed = False
+        path = credential_path(entry)
+        path_key = os.path.normcase(os.path.abspath(path))
+        shared = any(os.path.normcase(os.path.abspath(credential_path(a))) == path_key
+                     for a in registry["accounts"])
+        staged = None
+        if not shared:
+            staged = _unbind_credential_path(entry)
+            try:
+                # 先移动快照：文件被占用时保留绑定，用户可按同一名称重试。
+                if path != staged:
+                    os.replace(path, staged)
+            except FileNotFoundError:
+                staged = None
+            except OSError:
+                raise AccountsError("ERROR", "凭据副本暂时无法移除，账号仍绑定；请解除文件占用后"
+                                    "重试 signin.py unbind %s" % name) from None
+        try:
+            save_registry(registry)
+        except Exception:
+            if staged:
+                try:
+                    os.replace(staged, path)
+                except OSError:
+                    raise AccountsError("ERROR", "解绑未提交，凭据保留在 %s；请恢复到 %s 后重试"
+                                        % (staged, path)) from None
+            raise
+        cleanup_path = None
+        if staged:
+            try:
+                os.unlink(staged)
+                removed = True
+            except FileNotFoundError:
+                removed = True
+            except OSError:
+                cleanup_path = staged
+    out = {"account": name, "credential_removed": removed, "active": registry.get("active"),
+           "report": "已解绑账号「%s」，还剩 %d 个账号" % (name, len(registry["accounts"]))}
+    if cleanup_path:
+        out.update(needs_attention=True, credential_cleanup_path=cleanup_path)
+        out["report"] += "；凭据未能删除，请解除文件占用后删除：%s" % cleanup_path
+    return out
+
+
+def _credential_expiry_text(path):
+    try:
+        session = load_session(path)
+    except (OSError, ValueError, UnicodeError):
+        return ""
+    auth = session.get("auth") if isinstance(session, dict) else None
+    return _expires_text(auth.get("expiresAt") if isinstance(auth, dict) else None)
+
+
+def list_accounts():
+    registry = load_registry()
+    rows = []
+    for entry in registry["accounts"]:
+        rows.append({
+            "name": entry["name"],
+            "uid": _uid_hint(entry["uid"]),
+            "endpoint": entry["endpoint"],
+            "active": entry["name"] == registry.get("active"),
+            "credential_exists": os.path.exists(credential_path(entry)),
+            "expires_at": _credential_expiry_text(credential_path(entry)),
+            "last_run_at": entry["last_run_at"],
+            "last_result": entry["last_result"],
+        })
+    if rows:
+        report = "已绑定 %d 个账号：%s" % (len(rows), "，".join(
+            ("%s（当前）" if row["active"] else "%s") % row["name"] for row in rows))
+    else:
+        report = "还没有绑定任何账号；先登录 WorkBuddy 桌面端，再运行 signin.py bind <账号名>"
+    return {"count": len(rows), "active": registry.get("active"), "accounts": rows,
+            "directory": accounts_dir(), "report": report}
+
+
+def _missing_auth_error():
+    """凭据完全找不到时的 NO_AUTH；保留"环境变量指错了"这个更有用的诊断。"""
+    _, looked_in = find_auth_file()
+    override = os.environ.get("WORKBUDDY_AUTH_FILE")
+    if override:
+        report = "WORKBUDDY_AUTH_FILE 指向的文件不存在：%s" % override
+    else:
+        report = ("未找到 WorkBuddy 登录凭据。请先在本机登录 WorkBuddy 桌面端；"
+                  "或设置环境变量 WORKBUDDY_AUTH_FILE 指向 workbuddy-desktop.info。")
+    return AccountsError("NO_AUTH", report, looked_in=looked_in)
+
+
+def credential_plan(explicit=None, rotate=True):
+    """决定这一轮要跑哪些凭据。返回 ([(label, path, entry)], warnings)。
+
+    rotate=True（auto / silent / growth / 轮询）：清单里有账号就按轮转顺序全部跑；
+    没有账号清单时退回"客户端当前登录"这一份，行为与加入多账号之前完全一致。
+    rotate=False（status / claim / all / doctor）：只跑一个——显式指定的账号，否则
+    清单里的当前账号，最后才退回客户端当前登录。
+
+    explicit 取 "current"/"client" 表示忽略清单、只用客户端当前登录。
+    """
+    warnings = []
+    if explicit is not None:
+        if not isinstance(explicit, str) or not explicit.strip():
+            raise AccountsError("ERROR", "--account 的账号名不能为空")
+        if explicit.strip().lower() in ("current", "client"):
+            path, _ = find_auth_file()
+            if not path:
+                raise _missing_auth_error()
+            return [(None, path, None)], warnings
+        entry = find_account(explicit)
+        return [(entry["name"], credential_path(entry), entry)], warnings
+
+    try:
+        registry = load_registry()
+    except AccountsError as e:
+        # 清单坏了不能把当天的签到一起拖死：退回当前登录账号，并把问题写进汇报。
+        path, looked_in = find_auth_file()
+        if not path:
+            raise AccountsError("NO_AUTH", "%s；同时未找到客户端登录凭据" % e.report,
+                                looked_in=looked_in) from None
+        warnings.append("%s；本次只跑客户端当前登录账号" % e.report)
+        return [(None, path, None)], warnings
+
+    if not registry["accounts"]:
+        path, _ = find_auth_file()
+        if not path:
+            raise _missing_auth_error()
+        return [(None, path, None)], warnings
+
+    entries = registry["accounts"]
+    if not rotate:
+        active = registry.get("active")
+        entries = [a for a in entries if a["name"] == active][:1] or entries[:1]
+
+    # 按 uid 分组，但先给每个身份挑一份可用快照，再去重：否则「过期/丢失/损坏的同 uid
+    # 快照」排在前面时，后面那份有效快照会被当成重复身份跳过，整轮只剩一个错误。
+    groups = {}
+    for entry in entries:
+        # 缺失 UID 的旧记录按名称独立分组，键的类型避免与真实 UID 字符串碰撞。
+        key = ("uid", entry["uid"]) if entry["uid"] else ("name", entry["name"])
+        groups.setdefault(key, []).append(entry)
+
+    # 轮转顺序按「登录身份」排，不按别名排：同 uid 的旧别名可能永远没有运行时间，
+    # 不能让它把整个身份一直按在第一位，否则短预算下其它身份会被一直饿死。
+    ordered_groups = list(groups.values())
+    if rotate:
+        active = registry.get("active")
+        # 相同时间的并列用清单顺序兜底，而不是字母序：否则同一秒里跑完的身份会被
+        # 名字顺序重新排一遍，短预算下仍可能让某个身份一直排后面。
+        ordered_groups = sorted(ordered_groups, key=lambda group: _identity_sort_key(group, active))
+
+    contexts = []
+    for group in ordered_groups:
+        chosen = None
+        fallback = None
+        # 组间并列保留原始清单顺序，组内仍按原有快照优先级选凭据。
+        for entry in order_accounts({"accounts": group, "active": registry.get("active")}):
+            path, usable = _snapshot_state(entry)
+            if fallback is None:
+                fallback = (entry, path)
+            if usable:
+                chosen = (entry, path)
+                break
+        entry, path = chosen or fallback
+        if len(group) > 1:
+            skipped = "、".join("「%s」" % a["name"] for a in group if a["name"] != entry["name"])
+            warnings.append("账号「%s」与%s是同一个登录身份，本次只跑「%s」"
+                            % (entry["name"], skipped, entry["name"]))
+        contexts.append((entry["name"], path if path and os.path.exists(path) else None, entry))
+    return contexts, warnings
+
+
+def _record_account_run(name, out, code, expected):
+    """把本次结果记回清单，供下一次轮转排序与 accounts 展示；失败不影响主流程。"""
+    if not name or expected is None:
+        return
+    # 用短超时：定时任务不该为了记一行状态而卡住整轮预算。
+    try:
+        with _registry_lock(timeout=2.0):
+            registry = load_registry()
+            for entry in registry["accounts"]:
+                if entry["name"] == name:
+                    # 同名重绑（包括同 UID 在同一秒重绑）不能继承旧请求的结果。
+                    if any(entry.get(field) != expected.get(field)
+                           for field in ("uid", "credential", "bound_at")):
+                        return
+                    entry["last_run_at"] = datetime.now().astimezone().isoformat(
+                        timespec="seconds")
+                    entry["last_result"] = str(out.get("result") or "UNKNOWN")[:64]
+                    entry["last_code"] = as_int(code, 0)
+                    break
+            else:
+                return
+            save_registry(registry)
+    except Exception:
+        # 记状态是尽力而为：锁超时、磁盘满、清单损坏都不能拖垮本轮签到。
+        return
 
 
 def build_headers(session):
@@ -1697,7 +2411,14 @@ def run_daily(headers, endpoint):
                           "report": "成长中心异常（%s: %s）" % (type(e).__name__, e)}
     out["growth"] = gout.get("report")
     out["growth_result"] = gout.get("result")
-    if gout.get("credits_gained") or gcode != 0:
+    # 统一积分口径：本次新领到的 = 签到实发（仅 CLAIMED）+ 成长中心实发。
+    # ALREADY 里的 today_credit / total_credits 是历史值，绝不能算进"本次新增"，否则
+    # 多账号汇总会把每天的历史积分重复累加。
+    growth_credits = as_int(gout.get("credits_gained"), 0)
+    checkin_credits = as_int(out.get("credit"), 0) if out.get("result") == "CLAIMED" else 0
+    out["growth_credits"] = growth_credits
+    out["credits_gained"] = checkin_credits + growth_credits
+    if growth_credits or gcode != 0:
         out["report"] += "；" + gout["report"]
     # 成长中心有需要处理的失败即返回非零；保留签到成功结果，同时透传提醒。
     if gcode != 0 and code == 0:
@@ -1707,14 +2428,102 @@ def run_daily(headers, endpoint):
     return code, out, quiet
 
 
-def main():
+KNOWN_ACTIONS = ("auto", "silent", "growth", "silent-poll", "silent-growth",
+                 "status", "claim", "all", "doctor",
+                 "accounts", "bind", "use", "unbind", "help")
+# 账号管理命令：只操作账号清单，不联网。
+ACCOUNT_ACTIONS = ("accounts", "bind", "use", "unbind")
+# 轮转命令：绑定多个账号时，一个账号跑完自动切下一个。
+ROTATION_ACTIONS = ("auto", "silent", "growth", "silent-poll", "silent-growth")
+
+
+def _help_output():
+    return {"result": "HELP", "usage": [
+        "signin.py [auto|silent|growth|silent-poll|silent-growth|doctor|status|claim|all] "
+        "[--account <账号名|current>]",
+        "signin.py bind <账号名> [--from <凭据文件>] [--force]",
+        "signin.py accounts",
+        "signin.py use <账号名>",
+        "signin.py unbind <账号名>",
+    ], "report": "绑定多个账号后，auto/silent/growth/轮询会依次跑完全部账号；"
+                 "每个账号的凭据在 bind 时快照，重新登录后执行 bind <名字> --force 更新"}
+
+
+def _parse_argv(argv):
+    """把命令行拆成 (action, account, source, force)。
+
+    支持两种写法：`signin.py auto --account work` 与 `signin.py --account work auto`；
+    bind/use/unbind 的账号名也可以直接跟在命令后面。参数出错抛 ValueError，
+    由 main() 统一变成一条 ERROR 汇报（silent 模式同样落盘）。
+    """
+    args = list(argv)
+    account = source = None
+    force = False
+    positional = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in ("--account", "-a"):
+            index += 1
+            if index >= len(args):
+                raise ValueError("--account 需要一个账号名")
+            account = args[index]
+        elif arg.startswith("--account="):
+            account = arg.split("=", 1)[1]
+        elif arg in ("--from", "-f"):
+            index += 1
+            if index >= len(args):
+                raise ValueError("--from 需要一个凭据文件路径")
+            source = args[index]
+        elif arg.startswith("--from="):
+            source = arg.split("=", 1)[1]
+        elif arg == "--force":
+            force = True
+        elif arg in ("-h", "--help", "help"):
+            return "help", None, None, False
+        elif arg.startswith("-"):
+            raise ValueError("未知参数：%s" % arg)
+        else:
+            positional.append(arg)
+        index += 1
+
+    action = positional[0] if positional else "auto"
+    if account is not None and not account.strip():
+        raise ValueError("--account 需要一个非空账号名")
+    if source is not None and not source.strip():
+        raise ValueError("--from 需要一个非空凭据文件路径")
+    name = account
+    if action in ACCOUNT_ACTIONS:
+        if len(positional) > 1:
+            name = positional[1]
+        if len(positional) > 2:
+            raise ValueError("参数过多：%s" % " ".join(positional[2:]))
+    elif len(positional) > 1:
+        raise ValueError("参数过多：%s" % " ".join(positional[1:]))
+    if force and action != "bind":
+        raise ValueError("--force 只用于 bind")
+    if source is not None and action != "bind":
+        raise ValueError("--from 只用于 bind")
+    return action, name, source, force
+
+
+def main(argv=None):
     """薄壳：只负责取命令 + 兜住一切异常，保证 silent 模式下结果必定落盘。"""
-    action = sys.argv[1] if len(sys.argv) > 1 else "auto"
+    args = list(sys.argv[1:] if argv is None else argv)
     try:
-        return _run(action)
+        action, account, source, force = _parse_argv(args)
+    except ValueError as e:
+        emit({"result": "ERROR", "report": "命令行参数无效：%s" % e, "needs_attention": True},
+             args[0] if args else "auto")
+        return 2
+    try:
+        return _run(action, account, source, force)
     except AuthError as e:
         emit(e.output(), action)
         return 1
+    except AccountsError as e:
+        emit(e.output(), action)
+        return 2 if e.result == "NO_AUTH" else 1
     except Exception as e:
         # 无窗口运行下任何未捕获异常都会让当天的失败无痕消失，这里是最后一道防线
         emit({"result": "ERROR", "report": "脚本运行异常（%s）" % type(e).__name__,
@@ -1722,64 +2531,36 @@ def main():
         return 2
 
 
-def _run(action):
-    _start_budget(action)
-    known = ("auto", "silent", "growth", "silent-poll", "silent-growth", "status", "claim", "all", "doctor")
-    if action not in known:
-        emit({"result": "ERROR",
-              "report": "未知命令：%s（可用：%s）" % (action, " / ".join(known))},
-             action)
-        return 2
-
-    auth_file, looked_in = find_auth_file()
-    env_override = os.environ.get("WORKBUDDY_AUTH_FILE")
-    if not auth_file or not os.path.exists(auth_file):
-        if env_override:
-            report = ("WORKBUDDY_AUTH_FILE 指向的文件不存在：%s" % env_override)
+def _run_account_command(action, name, source, force):
+    """accounts / bind / use / unbind：只操作账号清单，不联网。"""
+    try:
+        if action == "accounts":
+            out = dict(list_accounts(), result="ACCOUNTS")
+        elif action == "bind":
+            if not name:
+                raise AccountsError("ERROR", "用法：signin.py bind <账号名> "
+                                             "[--from <凭据文件>] [--force]")
+            out = dict(bind_account(name, source, force), result="BOUND")
+        elif action == "use":
+            if not name:
+                raise AccountsError("ERROR", "用法：signin.py use <账号名>")
+            out = dict(use_account(name), result="ACTIVE")
         else:
-            report = ("未找到 WorkBuddy 登录凭据。请先在本机登录 WorkBuddy 桌面端；"
-                      "或设置环境变量 WORKBUDDY_AUTH_FILE 指向 workbuddy-desktop.info。")
-        emit({"result": "NO_AUTH", "report": report, "looked_in": looked_in,
-              "needs_attention": True}, action)
-        return 2
-
-    try:
-        session = load_session_retry(auth_file)
-    except json.JSONDecodeError as e:
-        # JSONDecodeError 是 ValueError 的子类，必须先于下面的分支捕获，否则会被误归类
-        emit({"result": "ERROR",
-              "report": "登录凭据文件不是合法 JSON（%s），请重新登录 WorkBuddy 桌面端" % e},
-             action)
-        return 2
-    except ValueError as e:
-        # 文件编码损坏（UnicodeDecodeError 也是 ValueError 子类）等情形
-        emit({"result": "ERROR",
-              "report": "登录凭据文件内容损坏（%s: %s），请重新登录 WorkBuddy 桌面端" % (type(e).__name__, e)},
-             action)
-        return 2
-    except Exception as e:
-        # 无读取权限等其它 IO 问题
-        emit({"result": "ERROR",
-              "report": "读取登录凭据失败（%s: %s），请重新登录 WorkBuddy 桌面端" % (type(e).__name__, e)},
-             action)
-        return 2
-
-    try:
-        if action == "doctor":
-            emit(run_doctor(session), action)
-            return 0
-        session = resolve_session(session)
-        headers = build_headers(session)
-    except AuthError as e:
+            if not name:
+                raise AccountsError("ERROR", "用法：signin.py unbind <账号名>")
+            out = dict(unbind_account(name), result="UNBOUND")
+    except AccountsError as e:
         emit(e.output(), action)
-        return 1
+        return 2 if e.result == "NO_AUTH" else 1
+    emit(out, action)
+    return 1 if out.get("needs_attention") else 0
 
-    endpoint = ((session.get("auth") or {}).get("endpoint") or DEFAULT_ENDPOINT).rstrip("/")
 
+def _dispatch(action, headers, endpoint):
+    """执行单账号动作，返回 (code, out, quiet, steps)。steps 只有调试命令会用到。"""
     if action in ("auto", "silent"):
-        code, out, _ = run_daily(headers, endpoint)
-        emit(out, action)
-        return code
+        code, out, quiet = run_daily(headers, endpoint)
+        return code, out, quiet, []
 
     if action in POLL_ACTIONS:
         # 轮询 = 补签 + 成长中心，结果写日志文件（emit 按 silent 前缀判定落盘）。
@@ -1787,44 +2568,206 @@ def _run(action):
         # 但那样一来 00:05 那次一旦失败（关机/睡眠/刚开机网络没就绪），当天就再无
         # 第二次机会。现在每次轮询都先查一次签到状态，未签才补——已签的代价只是
         # 一个查询请求，换来的是一天七次机会。
-        # 空跑默认不落盘——一天要跑好几轮，全写进去只会把真正有价值的记录
-        # 淹没在一串"Buddy 旅行中"里。要看完整过程就设 WORKBUDDY_GROWTH_LOG_EMPTY=1。
         code, out, quiet = run_daily(headers, endpoint)
         out["trigger"] = "poll"
-        if (not quiet) or _env_flag("WORKBUDDY_GROWTH_LOG_EMPTY"):
-            emit(out, action)
-        return code
+        return code, out, quiet, []
 
     if action == "growth":
         code, out = run_growth(headers, endpoint)
         out["needs_attention"] = code != 0
-        emit(out, action)
-        return code
+        return code, out, False, []
 
     # 以下为交互式调试命令，输出原始返回。走 emit 而非 print，这样非法配置的
     # config_warning 同样能带出来（这些命令不会是 silent，仍然打到 stdout）
+    steps = []
     if action in ("status", "all"):
-        scode, sbody = post(endpoint + "/v2/billing/meter/checkin-activity-status", headers, retry=True)
+        scode, sbody = post(endpoint + "/v2/billing/meter/checkin-activity-status",
+                            headers, retry=True)
         if scode in (401, 403):
-            emit(dict(_auth_failure(scode), step="status"), action)
-            return 1
-        emit({"step": "status", "http": scode, "body": sbody,
-              "needs_attention": not 200 <= scode < 300}, action)
+            out = dict(_auth_failure(scode), step="status")
+            steps.append(out)
+            return 1, out, False, steps
+        out = {"step": "status", "http": scode, "body": sbody,
+               "needs_attention": not 200 <= scode < 300}
+        steps.append(out)
         if not 200 <= scode < 300:
-            return 1
+            return 1, out, False, steps
 
     if action in ("claim", "all"):
         ccode, cbody = post(endpoint + "/v2/billing/meter/daily-checkin", headers, retry=True)
         if ccode in (401, 403):
-            emit(dict(_auth_failure(ccode), step="claim"), action)
-            return 1
+            out = dict(_auth_failure(ccode), step="claim")
+            steps.append(out)
+            return 1, out, False, steps
         success = 200 <= ccode < 300 or (ccode == 400 and _is_already_checked_in(cbody))
-        emit({"step": "claim", "http": ccode, "body": cbody,
-              "needs_attention": not success}, action)
-        if not success:
-            return 1
+        out = {"step": "claim", "http": ccode, "body": cbody, "needs_attention": not success}
+        steps.append(out)
+        return (0 if success else 1), out, False, steps
 
-    return 0
+    return 0, {"result": "OK"}, False, steps
+
+
+def _run_one_account(action, auth_file, label=None, entry=None):
+    """跑单个账号的凭据；返回 (code, out, quiet, steps)，所有异常都转成可汇报结果。"""
+    if auth_file is None:
+        return 1, {"result": "MISSING", "needs_attention": True,
+                   "report": "该账号的凭据副本已丢失，请重新登录该账号后执行 bind --force"}, False, []
+
+    try:
+        session = load_session_retry(auth_file)
+    except json.JSONDecodeError as e:
+        # JSONDecodeError 是 ValueError 的子类，必须先于下面的分支捕获，否则会被误归类
+        return 2, {"result": "ERROR", "needs_attention": True,
+                   "report": "登录凭据文件不是合法 JSON（%s），请重新登录 WorkBuddy 桌面端" % e}, False, []
+    except ValueError as e:
+        # 文件编码损坏（UnicodeDecodeError 也是 ValueError 子类）等情形
+        return 2, {"result": "ERROR", "needs_attention": True,
+                   "report": "登录凭据文件内容损坏（%s: %s），请重新登录 WorkBuddy 桌面端"
+                             % (type(e).__name__, e)}, False, []
+    except Exception as e:
+        # 无读取权限等其它 IO 问题
+        return 2, {"result": "ERROR", "needs_attention": True,
+                   "report": "读取登录凭据失败（%s: %s），请重新登录 WorkBuddy 桌面端"
+                             % (type(e).__name__, e)}, False, []
+
+    try:
+        _validate_session(session)
+        if entry and entry.get("uid") and session["account"]["uid"] != entry["uid"]:
+            raise AuthError("UID_MISMATCH")
+        if action == "doctor":
+            return 0, run_doctor(session), False, []
+        # 过期预判只适用于绑定快照；客户端当前登录沿用原有服务端认证行为。
+        expired = _session_expired(session) if entry else None
+        if expired:
+            hint = ("signin.py bind %s --force" % label) if label else "bind --force"
+            return 1, {"result": "EXPIRED", "needs_attention": True,
+                       "report": "该账号的登录凭据已于 %s 过期，请重新登录该账号后执行 %s"
+                                 % (expired, hint)}, False, []
+        session = resolve_session(session)
+        headers = build_headers(session)
+    except AuthError as e:
+        return 1, e.output(), False, []
+
+    endpoint = ((session.get("auth") or {}).get("endpoint") or DEFAULT_ENDPOINT).rstrip("/")
+    # 只有具名账号（绑定过的）才带 uid 提示：没绑账号时输出与原来保持一致。
+    out_entry = {"uid_hint": _uid_hint(session["account"].get("uid"))} if label else {}
+    code, out, quiet, steps = _dispatch(action, headers, endpoint)
+    out = dict(out_entry, **out) if isinstance(out, dict) else out
+    return code, out, quiet, steps
+
+
+def _run_rotation(action, contexts, warnings):
+    """多账号串行：一个账号跑完再切下一个；单个账号失败不中断其余账号。
+
+    预算在同一份总预算里按"剩余时间 / 剩余账号数"切片（见 _budget_slice），
+    已启动的账号至少取得 ACCOUNT_MIN_SLICE；总剩余时间不够启动新账号时，
+    剩下的账号记 DEFERRED 留给下一轮——
+    绝不能让定时任务跑穿 ExecutionTimeLimit 被系统强杀，那样连日志都写不出来。
+    """
+    total = len(contexts)
+    results = []
+    overall = 0
+    quiet_all = True
+    credits = 0
+    total_state = _budget_snapshot()
+    for index, (label, path, entry) in enumerate(contexts):
+        remaining = _budget_left()
+        if remaining < ACCOUNT_MIN_SLICE:
+            for rest_label, _, _ in contexts[index:]:
+                results.append({"account": rest_label or "客户端当前登录", "result": "DEFERRED",
+                                "code": 0, "report": "时间预算不足，留到下一轮"})
+            quiet_all = False
+            break
+        _budget_slice(max(ACCOUNT_MIN_SLICE, remaining / (total - index)))
+        try:
+            code, out, quiet, _ = _run_one_account(action, path, label, entry)
+        except Exception as e:
+            # 一个账号的意外异常绝不能带走其余账号——"切到下一个账号"正是这个功能的意义。
+            code, quiet = 2, False
+            out = {"result": "ERROR", "needs_attention": True,
+                   "report": "该账号执行异常（%s: %s）" % (type(e).__name__, e)}
+        finally:
+            _budget_restore(total_state)
+        quiet_all = quiet_all and quiet
+        if code != 0:
+            overall = 1
+        credits += as_int(out.get("credits_gained"), 0)
+        row = {"account": label or "客户端当前登录", "result": out.get("result"),
+               "code": code, "report": out.get("report")}
+        if out.get("uid_hint"):
+            row["uid"] = out["uid_hint"]
+        results.append(row)
+        _record_account_run(label, out, code, entry)
+
+    out = {"result": "ALL", "total": total, "accounts": results, "credits_gained": credits,
+           "needs_attention": overall != 0,
+           "report": "共 %d 个账号 → %s" % (total, "；".join(
+               "[%s] %s" % (row["account"], row["report"]) for row in results))}
+    if warnings:
+        out["account_warnings"] = warnings
+    if action in POLL_ACTIONS:
+        # 空跑默认不落盘——一天要跑好几轮，全写进去只会把真正有价值的记录
+        # 淹没在一串"Buddy 旅行中"里。要看完整过程就设 WORKBUDDY_GROWTH_LOG_EMPTY=1。
+        out["trigger"] = "poll"
+        if (not quiet_all) or _env_flag("WORKBUDDY_GROWTH_LOG_EMPTY"):
+            emit(out, action)
+        return overall
+    emit(out, action)
+    return overall
+
+
+def _run(action, account=None, source=None, force=False):
+    name = account
+    # auto-all / silent-all 是显式写法，语义与绑定多账号后的 auto / silent 相同。
+    if action in ("auto-all", "silent-all"):
+        action = "silent" if action == "silent-all" else "auto"
+    _start_budget(action)
+    if action not in KNOWN_ACTIONS:
+        emit({"result": "ERROR",
+              "report": "未知命令：%s（可用：%s）" % (action, " / ".join(KNOWN_ACTIONS))},
+             action)
+        return 2
+
+    if action in ACCOUNT_ACTIONS:
+        return _run_account_command(action, name, source, force)
+
+    if action == "help":
+        emit(_help_output(), action)
+        return 0
+
+    try:
+        contexts, warnings = credential_plan(name, rotate=action in ROTATION_ACTIONS)
+    except AccountsError as e:
+        emit(e.output(), action)
+        return 2 if e.result == "NO_AUTH" else 1
+
+    if not contexts:
+        emit({"result": "NO_ACCOUNTS", "report": "账号清单里没有可执行的账号；"
+                                                "请先登录 WorkBuddy 桌面端后运行 signin.py bind <账号名>",
+              "needs_attention": True}, action)
+        return 1
+
+    if len(contexts) > 1:
+        # 多账号：预算要按账号数放大（默认值），再在账号之间切片。
+        _start_budget(action, len(contexts))
+        return _run_rotation(action, contexts, warnings)
+
+    label, path, entry = contexts[0]
+    code, out, quiet, steps = _run_one_account(action, path, label, entry)
+    _record_account_run(label, out, code, entry)
+    if label:
+        out.setdefault("account", label)
+    if warnings:
+        out["account_warnings"] = warnings
+    for step in steps:
+        emit(step, action)
+    if not steps:
+        if action in POLL_ACTIONS:
+            if (not quiet) or _env_flag("WORKBUDDY_GROWTH_LOG_EMPTY"):
+                emit(out, action)
+        else:
+            emit(out, action)
+    return code
 
 if __name__ == "__main__":
     sys.exit(main())

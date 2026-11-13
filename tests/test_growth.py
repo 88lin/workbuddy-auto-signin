@@ -248,7 +248,8 @@ class MakeupTests(unittest.TestCase):
             log = Path(temp) / "signin.log"
             auth.write_text(json.dumps(session), encoding="utf-8")
             with patch.dict(os.environ, {"WORKBUDDY_AUTH_FILE": str(auth),
-                                         "WORKBUDDY_SIGNIN_LOG": str(log)}), \
+                                         "WORKBUDDY_SIGNIN_LOG": str(log),
+                                         "WORKBUDDY_ACCOUNTS_DIR": str(Path(temp) / "accounts")}), \
                     patch.object(signin, "run_auto", return_value=(0, {
                         "result": "ALREADY", "report": "今日已签过"})):
                 for action in ("silent-poll", "silent-growth"):
