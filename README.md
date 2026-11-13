@@ -342,7 +342,7 @@ python signin.py accounts
 - **只跑一个**：`--account <名字>`；`--account current` 表示用客户端当前登录的凭据（忽略账号清单）。
 - **积分汇总**：多账号输出顶层的 `credits_gained` 是**本次新领到**的积分合计（签到实发 + 成长中心实发）；`ALREADY` 里的历史积分不计入，避免每天重复累加。
 
-`silent` / `silent-poll` 的轮询去重不变：所有账号都「已签且成长中心无可领项」时仍然不写日志。
+`silent` 每次运行都会写日志；`silent-poll` / `silent-growth` 默认省略空跑日志：所有账号都「已签且成长中心无可领项」时不写日志，有失败、领取或推迟账号时会记录。设置 `WORKBUDDY_GROWTH_LOG_EMPTY=1` 可记录每轮轮询结果。
 
 ### 凭据过期与重新绑定
 
