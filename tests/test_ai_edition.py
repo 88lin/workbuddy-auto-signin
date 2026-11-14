@@ -143,6 +143,7 @@ class RuntimeDiscoveryTests(unittest.TestCase):
         environ = {"WORKBUDDY_EXE": "", "LOCALAPPDATA": self.LOCAL,
                    "ProgramFiles": r"C:\Program Files", "ProgramFiles(x86)": ""}
         with patch.object(sys, "platform", "win32"), \
+                patch("os.name", "nt"), \
                 patch.dict(sys.modules, {"winreg": registry or FakeRegistry()}), \
                 patch.dict(os.environ, environ), \
                 patch("os.path.join", ntpath.join), patch("os.path.abspath", lambda p: p), \
@@ -168,6 +169,7 @@ class RuntimeDiscoveryTests(unittest.TestCase):
 
     def test_default_edition_is_domestic(self):
         with patch.object(sys, "platform", "win32"), \
+                patch("os.name", "nt"), \
                 patch.dict(os.environ, {"WORKBUDDY_EXE": "", "LOCALAPPDATA": self.LOCAL,
                                         "ProgramFiles": r"C:\Program Files", "ProgramFiles(x86)": ""}), \
                 patch("os.path.join", ntpath.join), patch("os.path.abspath", lambda p: p), \
@@ -198,6 +200,9 @@ class RuntimeDiscoveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             exe = os.path.join(temp, "custom.exe")
             Path(exe).write_bytes(b"")
+            # A real override has to be executable on POSIX; write_bytes alone
+            # leaves 0644, which find_workbuddy_runtime correctly refuses.
+            os.chmod(exe, 0o755)
             with patch.dict(os.environ, {"WORKBUDDY_EXE": exe}):
                 self.assertEqual(signin.find_workbuddy_runtime(signin.EDITION_AI), os.path.abspath(exe))
 
