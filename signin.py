@@ -69,6 +69,22 @@ from datetime import date, datetime
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
 AUTH_BASENAME = os.path.join("CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info")
+# WorkBuddy AI 版（Windows 实测 5.9.4）：凭据 JSON 结构与国内版相同，但文件名带 -ai 后缀、
+# 不写 auth.endpoint，只用 auth.domain = "www.workbuddy.ai" 标明后端；客户端装在
+# WorkBuddyAI\WorkBuddyAI.exe，卸载项名为 "WorkBuddy AI <版本>"。加密信封要由写出它的那个
+# 客户端解密（两版客户端各自持有密钥），因此运行时查找也按版本区分。
+AI_AUTH_BASENAME = os.path.join("CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop-ai.info")
+AI_DOMAIN = "www.workbuddy.ai"
+AI_ENDPOINT = "https://www.workbuddy.ai"
+EDITION_CN = "cn"
+EDITION_AI = "ai"
+RUNTIME_LAYOUTS = {
+    # 版本 -> (安装目录名, 可执行文件名, 卸载项 DisplayName 正则)
+    EDITION_CN: ("WorkBuddy", "WorkBuddy.exe",
+                 r"WorkBuddy(?:\s+\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?)?"),
+    EDITION_AI: ("WorkBuddyAI", "WorkBuddyAI.exe",
+                 r"WorkBuddy\s*AI(?:\s+\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?)?"),
+}
 # Linux 没有桌面端，入口是 CodeBuddy CLI；它写出的凭据文件名不同、放在 XDG 数据目录
 # （issue #4 实测：~/.local/share/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info，
 #  JSON 结构与桌面端一致，签到/成长中心接口全部照常工作）
@@ -272,6 +288,31 @@ def _valid_token(token):
             and re.fullmatch(r"[A-Za-z0-9._~+/-]+=*", token) is not None)
 
 
+def _session_edition(session):
+    """凭据属于哪一版客户端。只看 auth.domain 与显式 endpoint 的主机名，不解密、不联网。"""
+    auth = session.get("auth") if isinstance(session, dict) else None
+    if not isinstance(auth, dict):
+        return EDITION_CN
+    domain = auth.get("domain")
+    if isinstance(domain, str) and domain.casefold() == AI_DOMAIN:
+        return EDITION_AI
+    endpoint = auth.get("endpoint")
+    if isinstance(endpoint, str) and endpoint:
+        try:
+            if (urllib.parse.urlsplit(endpoint).hostname or "").casefold() == AI_DOMAIN:
+                return EDITION_AI
+        except ValueError:
+            pass
+    return EDITION_CN
+
+
+def session_endpoint(session):
+    """会话实际使用的服务地址：显式 endpoint 优先；缺省时按客户端版本取默认值。"""
+    auth = session.get("auth") or {}
+    default = AI_ENDPOINT if _session_edition(session) == EDITION_AI else DEFAULT_ENDPOINT
+    return (auth.get("endpoint") or default).rstrip("/")
+
+
 def _validate_session(session):
     if not isinstance(session, dict):
         raise AuthError("INVALID_FORMAT")
@@ -291,7 +332,7 @@ def _validate_session(session):
                 raise AuthError("INVALID_FORMAT")
     endpoint = session["auth"].get("endpoint")
     if endpoint in (None, ""):
-        endpoint = DEFAULT_ENDPOINT
+        endpoint = AI_ENDPOINT if _session_edition(session) == EDITION_AI else DEFAULT_ENDPOINT
     if not isinstance(endpoint, str) or re.search(r"[\s\x00-\x1f\x7f]", endpoint):
         raise AuthError("INVALID_FORMAT")
     try:
@@ -365,7 +406,7 @@ def _registry_text(registry, key, field):
         return None
 
 
-def _registry_runtime_path(value, icon=False):
+def _registry_runtime_path(value, icon=False, exe="WorkBuddy.exe"):
     """Parse a directory or DisplayIcon; never interpret an uninstall command."""
     if not isinstance(value, str) or re.search(r"[\x00-\x1f\x7f]", value):
         return None
@@ -384,14 +425,14 @@ def _registry_runtime_path(value, icon=False):
     if not ntpath.splitdrive(value)[0] or not ntpath.isabs(value):
         return None
     if not icon:
-        value = ntpath.join(value, "WorkBuddy.exe")
+        value = ntpath.join(value, exe)
     value = ntpath.normpath(value)
-    if ntpath.basename(value).casefold() != "workbuddy.exe":
+    if ntpath.basename(value).casefold() != exe.casefold():
         return None
     return value
 
 
-def _windows_registry_runtimes():
+def _windows_registry_runtimes(edition=EDITION_CN):
     """Yield existing clients from user/machine uninstall entries, lazily.
 
     Keep the import and all platform-specific constants inside this Windows-only
@@ -403,6 +444,7 @@ def _windows_registry_runtimes():
         import winreg
     except ImportError:
         return
+    _, exe, display_name = RUNTIME_LAYOUTS[edition]
     subkey = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
     seen = set()
     for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
@@ -415,14 +457,13 @@ def _windows_registry_runtimes():
                             with winreg.OpenKey(root, winreg.EnumKey(root, index),
                                                 0, winreg.KEY_READ | view) as entry:
                                 name = _registry_text(winreg, entry, "DisplayName")
-                                if not name or not re.fullmatch(
-                                        r"WorkBuddy(?:\s+\d+(?:\.\d+)*(?:[-+][0-9A-Za-z.-]+)?)?",
-                                        name.strip(), re.IGNORECASE):
+                                if not name or not re.fullmatch(display_name, name.strip(), re.IGNORECASE):
                                     continue
                                 # A stale InstallLocation must not mask a valid DisplayIcon.
                                 for field in ("InstallLocation", "DisplayIcon"):
                                     path = _registry_runtime_path(
-                                        _registry_text(winreg, entry, field), icon=field == "DisplayIcon")
+                                        _registry_text(winreg, entry, field), icon=field == "DisplayIcon",
+                                        exe=exe)
                                     if path and ntpath.normcase(path) not in seen:
                                         seen.add(ntpath.normcase(path))
                                         if os.path.isfile(path):
@@ -434,7 +475,12 @@ def _windows_registry_runtimes():
                 continue
 
 
-def find_workbuddy_runtime():
+def find_workbuddy_runtime(edition=EDITION_CN):
+    """找与凭据同版本的客户端运行时。WORKBUDDY_EXE 显式指定时始终优先。
+
+    国内版与 AI 版互不回退：另一版客户端解不开这份信封（只会得到 KEY_MISMATCH），
+    找不到时如实报告 RUNTIME_NOT_FOUND 更容易排查。macOS 暂只支持国内版的 WorkBuddy.app。
+    """
     override = os.environ.get("WORKBUDDY_EXE")
     if override:
         path = os.path.abspath(os.path.expanduser(override))
@@ -444,19 +490,20 @@ def find_workbuddy_runtime():
     home = os.path.expanduser("~")
     candidates = []
     if sys.platform == "win32":
+        folder, exe, _ = RUNTIME_LAYOUTS[edition]
         local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
-        candidates.append(os.path.join(local, "Programs", "WorkBuddy", "WorkBuddy.exe"))
+        candidates.append(os.path.join(local, "Programs", folder, exe))
         for name in ("ProgramFiles", "ProgramFiles(x86)"):
             if os.environ.get(name):
-                candidates.append(os.path.join(os.environ[name], "WorkBuddy", "WorkBuddy.exe"))
-    elif sys.platform == "darwin":
+                candidates.append(os.path.join(os.environ[name], folder, exe))
+    elif sys.platform == "darwin" and edition == EDITION_CN:
         candidates = [_mac_runtime(os.path.join(root, "WorkBuddy.app"))
                       for root in ("/Applications", os.path.join(home, "Applications"))]
     for path in candidates:
         if path and os.path.isfile(path) and (os.name == "nt" or os.access(path, os.X_OK)):
             return os.path.abspath(path)
     if sys.platform == "win32":
-        with closing(_windows_registry_runtimes()) as entries:
+        with closing(_windows_registry_runtimes(edition)) as entries:
             registered = next(entries, None)
         if registered:
             return registered
@@ -554,7 +601,8 @@ def resolve_session(session):
     _validate_session(session)
     token = session["auth"]["accessToken"]
     if _token_format(token) != "plaintext":
-        token = _run_auth_helper(find_workbuddy_runtime(), {"operation": "decrypt", "value": token})["accessToken"]
+        token = _run_auth_helper(find_workbuddy_runtime(_session_edition(session)),
+                                 {"operation": "decrypt", "value": token})["accessToken"]
     _sensitive_values.add(token)
     return dict(session, auth=dict(session["auth"], accessToken=token))
 
@@ -565,7 +613,7 @@ def run_doctor(session):
     out = {"result": "AUTH_READY", "credential_format": kind, "needs_attention": False,
            "report": "本地凭据格式有效；未验证服务端登录状态", "online_checked": False}
     if kind == "sym-v1":
-        runtime = find_workbuddy_runtime()
+        runtime = find_workbuddy_runtime(_session_edition(session))
         probe = _run_auth_helper(runtime, {"operation": "probe"})
         out.update(runtime=runtime, electron_version=probe["electron"],
                    report="已识别加密凭据，运行时具备解密能力；未提取密钥、未验证解密或服务端登录状态")
@@ -672,6 +720,7 @@ def find_auth_file():
     xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share")
     candidates = [
         os.path.join(local, AUTH_BASENAME),                                  # Windows 桌面端
+        os.path.join(local, AI_AUTH_BASENAME),                               # Windows 桌面端（AI 版）
         os.path.join(home, "Library", "Application Support", AUTH_BASENAME),  # macOS 桌面端
         os.path.join(xdg_data, CLI_AUTH_BASENAME),                           # Linux CodeBuddy CLI
         os.path.join(home, ".config", AUTH_BASENAME),                        # Linux（旧猜测，保留）
@@ -1063,7 +1112,7 @@ def bind_account(name, source=None, force=False):
         raise AccountsError("ERROR", "凭据文件不是合法 JSON：%s" % path) from None
 
     uid = session["account"]["uid"]
-    endpoint = ((session.get("auth") or {}).get("endpoint") or DEFAULT_ENDPOINT).rstrip("/")
+    endpoint = session_endpoint(session)
     credential = _credential_filename(name)
     target = os.path.join(accounts_dir(), credential)
     target_key = os.path.normcase(os.path.abspath(target))
@@ -2648,7 +2697,7 @@ def _run_one_account(action, auth_file, label=None, entry=None):
     except AuthError as e:
         return 1, e.output(), False, []
 
-    endpoint = ((session.get("auth") or {}).get("endpoint") or DEFAULT_ENDPOINT).rstrip("/")
+    endpoint = session_endpoint(session)
     # 只有具名账号（绑定过的）才带 uid 提示：没绑账号时输出与原来保持一致。
     out_entry = {"uid_hint": _uid_hint(session["account"].get("uid"))} if label else {}
     code, out, quiet, steps = _dispatch(action, headers, endpoint)

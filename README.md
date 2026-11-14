@@ -62,7 +62,7 @@
 
 ## 📋 前置条件
 
-- ✅ 已安装并**登录过 WorkBuddy 桌面端**（登录后自动写出凭据文件，脚本靠它鉴权）；**Linux 没有**桌面端，登录过 [CodeBuddy CLI](https://www.codebuddy.cn) 即可，脚本会自动探测它的凭据
+- ✅ 已安装并**登录过 WorkBuddy 桌面端**（登录后自动写出凭据文件，脚本靠它鉴权；Windows 上的 **WorkBuddy AI 版**也会自动识别，见[工作原理](#workbuddy-ai)）；**Linux 没有**桌面端，登录过 [CodeBuddy CLI](https://www.codebuddy.cn) 即可，脚本会自动探测它的凭据
 - ✅ 本机有 **Python 3**（任意版本，无需任何第三方包）
 - ⬜ 可选：装了 `git` 就能直接 `clone`；没有的话去仓库页面 **Code → Download ZIP** 解压，效果一样
 - 🎁 可选：想顺便自动领 **Qoder CN** 的每日 100 Credits，需已登录 Qoder CN 桌面端；见[可选：Qoder CN](#qoder-cn)
@@ -380,7 +380,12 @@ python signin.py bind <名字> --force
 | Windows / macOS 旧明文、Linux CodeBuddy CLI 明文 | 保留原路径，无需客户端解密运行时 |
 | Windows 新版字段加密 | 支持 `sym-v1 / suite 1`；5.6.2、5.7.3、5.8.3 已进行本机解密与只读认证验证，其他版本按格式与运行时能力检测 |
 | macOS 新版字段加密 | 已实现 `.app` 可执行文件发现及同一管道协议；尚待客户端实机验证 |
+| Windows · WorkBuddy AI 版 | 凭据为 `workbuddy-desktop-ai.info`，后端为 `https://www.workbuddy.ai`；加密凭据用 AI 版自己的 `WorkBuddyAI.exe` 解密。5.9.4 已进行本机解密与只读认证验证 |
 | 其他加密格式或不具备原生存储接口的运行时 | 明确返回 `AUTH_ERROR`，不发送无效令牌 |
+
+<a id="workbuddy-ai"></a>
+
+**WorkBuddy AI 版**的凭据结构与国内版相同，区别是文件名带 `-ai` 后缀、不写 `auth.endpoint`，只用 `auth.domain = www.workbuddy.ai` 标明后端。脚本据此把默认服务地址设为 `https://www.workbuddy.ai`，凭据里显式写了 `endpoint` 时仍以它为准。两版客户端各自持有解密密钥，所以运行时也按版本查找（`WorkBuddyAI\WorkBuddyAI.exe`、卸载项 `WorkBuddy AI <版本>`），不会拿另一版客户端去解密。两版都装且都登录时默认读国内版凭据；要跑 AI 版，用 `WORKBUDDY_AUTH_FILE` 指向 `workbuddy-desktop-ai.info`，或用 `bind <名字> --from <路径>` 把它绑定成一个账号。macOS 的 AI 版尚未适配。
 
 客户端升级可能改变私有接口或格式。先运行 `python signin.py doctor` 检查本地能力，再运行只读的 `python signin.py status` 验证服务端认证；`doctor` 成功不表示解密或服务端认证已验证。
 
@@ -399,7 +404,7 @@ Windows 按 `WORKBUDDY_EXE → 默认安装目录 → 注册表` 的顺序发现
 > [!NOTE]
 > 查询请求按网络错误或服务端 5xx 退避重试，次数受时间预算限制；补登、抽奖、领奖等写操作**不**重试，避免超时发生在服务端处理完成之后造成重复提交。两个签到接口例外——状态查询是只读的，领取接口本身幂等（当天重复领取只会返回「已签」，不会再发一次积分），故允许重试。整个运行受时间预算约束，详见「配置」。
 >
-> 所有请求都打到官方客户端用的同一个 endpoint（`https://copilot.tencent.com`）。签到接口系从桌面端 `app.asar` 逆向得到，仅供个人自动化使用。
+> 所有请求都打到官方客户端用的同一个 endpoint（国内版 `https://copilot.tencent.com`，AI 版 `https://www.workbuddy.ai`）。签到接口系从桌面端 `app.asar` 逆向得到，仅供个人自动化使用。
 
 ---
 
@@ -409,7 +414,7 @@ Windows 按 `WORKBUDDY_EXE → 默认安装目录 → 注册表` 的顺序发现
 |---|---|
 | `WORKBUDDY_AUTH_FILE` | 自动探测失败时，手动指定凭据文件路径 |
 | `WORKBUDDY_ACCOUNTS_DIR` | 多账号清单与凭据副本的存放目录（默认脚本同目录的 `accounts/`）。目录里是本机登录凭据副本，建议放在只允许自己访问的位置 |
-| `WORKBUDDY_EXE` | 指定与加密凭据对应的客户端**可执行文件**；Windows 为 `WorkBuddy.exe`，macOS 为 `.app/Contents/MacOS/` 内实际可执行文件。路径错误时直接报告，不静默回退 |
+| `WORKBUDDY_EXE` | 指定与加密凭据对应的客户端**可执行文件**；Windows 为 `WorkBuddy.exe`（AI 版为 `WorkBuddyAI.exe`），macOS 为 `.app/Contents/MacOS/` 内实际可执行文件。路径错误时直接报告，不静默回退 |
 | `WORKBUDDY_SIGNIN_LOG` | `silent` 模式下日志文件路径（默认 `signin.log`） |
 | `WORKBUDDY_BUDGET_SECONDS` | 单次运行的网络请求时间预算。签到类命令默认 `420`（7 分钟）、上限 `540`；`silent-poll` / `silent-growth` 轮询默认 `180`、上限 `240`。**Windows 上须为正数且小于对应计划任务的 `ExecutionTimeLimit`**（macOS launchd 无此限制）。非法值、`≤0` 或超上限都会夹到安全值，并在输出里附 `config_warning` |
 | `WORKBUDDY_GROWTH_LOG_EMPTY` | 设为 `1`（或 `true`/`yes`/`on`）时，`silent-poll` 连空跑也写日志；默认只在领到东西或出错时记录 |
