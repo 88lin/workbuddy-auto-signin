@@ -64,6 +64,7 @@
 
 - ✅ 已安装并**登录过 WorkBuddy 桌面端**（登录后自动写出凭据文件，脚本靠它鉴权；Windows 上的 **WorkBuddy AI 版**也会自动识别，见[工作原理](#workbuddy-ai)）；**Linux 没有**桌面端，登录过 [CodeBuddy CLI](https://www.codebuddy.cn) 即可，脚本会自动探测它的凭据
 - ✅ 本机有 **Python 3**（任意版本，无需任何第三方包）
+- ✅ Windows 用模式 B 定时（含 Qoder CN）需要 **Windows 8 及以上**：`.ps1` 依赖系统自带的 `ScheduledTasks` 模块，Windows 7 没有这个组件、升级 PowerShell 也补不上，`schtasks.exe` 不是同一套。实测环境是 Windows 10 22H2 + Windows PowerShell 5.1；Windows 11 只在 CI 里跑过，未做真机验证
 - ⬜ 可选：装了 `git` 就能直接 `clone`；没有的话去仓库页面 **Code → Download ZIP** 解压，效果一样
 - 🎁 可选：想顺便自动领 **Qoder CN** 的每日 100 Credits，需已登录 Qoder CN 桌面端；见[可选：Qoder CN](#qoder-cn)
 
@@ -174,6 +175,14 @@ powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
 > 探测不到 Python 时脚本会提示你手动填：编辑 `install-windows.ps1`，把顶部的 `$ManualPythonw` 改成 `pythonw.exe` 的完整路径即可（`$ManualSignin` 同理，一般不用动）。任意 Python 3 自带的 `pythonw.exe` 都行，不限于系统 Python。
 
 **卸载**：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\uninstall-windows.ps1
+```
+
+与 `install-windows.ps1` 同粒度：只注销 `WorkBuddyAutoSignin` 和 `WorkBuddyGrowthPoll`，不碰 `QoderDailyCredits`。每个任务删完都会回读确认，确实不存在才报「完成」；任一步失败会打印可复制的手动命令并以退出码 `1` 结束。不动脚本文件、不删日志，日志路径在结尾打印出来。
+
+只想撤掉其中一个的话，手敲命令：
 
 ```powershell
 Unregister-ScheduledTask -TaskName "WorkBuddyAutoSignin" -Confirm:$false
@@ -541,6 +550,16 @@ python qoder_signin.py auto            # 真的领取（幂等）
 **日志**：默认写在脚本同目录的 `qoder_signin.log`。和 WorkBuddy 轮询一样，只有**真领到、活动异常或出错**才落盘；「已领过」「没有活动」不写。想连空跑也记录，设 `QODER_SIGNIN_LOG_EMPTY=1`。
 
 **卸载**：
+
+Windows：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\uninstall-qoder-windows.ps1
+```
+
+与 `install-qoder-windows.ps1` 同粒度：只注销 `QoderDailyCredits`，不碰 WorkBuddy 那两个任务。删完会回读确认，确实不存在才报「完成」；失败会打印可复制的手动命令并以退出码 `1` 结束。不动脚本文件、不删日志，日志路径在结尾打印出来。
+
+只想手敲一条的话：
 
 ```powershell
 Unregister-ScheduledTask -TaskName "QoderDailyCredits" -Confirm:$false
