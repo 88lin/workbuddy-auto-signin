@@ -52,6 +52,7 @@ $fake = New-Module -ArgumentList $TracePath, $Scenario -ScriptBlock {
     $script:ErrorActionPreference = 'Continue'
     $script:TracePath = $TracePath
     $script:Scenario = $Scenario
+    $script:ScanCount = 0
     $script:Existing = [ordered]@{}
     if ($Scenario -ne 'absent') {
         foreach ($n in 'WorkBuddyAutoSignin', 'WorkBuddyGrowthPoll') {
@@ -71,6 +72,13 @@ $fake = New-Module -ArgumentList $TracePath, $Scenario -ScriptBlock {
     function Get-ScheduledTask {
         [CmdletBinding()] param($TaskName, $TaskPath)
         if (-not $PSBoundParameters.ContainsKey('TaskName')) {
+            $script:ScanCount += 1
+            if (($script:Scenario -eq 'query-denied' -and $script:ScanCount -eq 1) -or
+                ($script:Scenario -eq 'readback-denied' -and $script:ScanCount -eq 2)) {
+                Trace 'scan-failed' '*' @($script:Existing.Keys)
+                Write-Error 'Access is denied (0x80070005)'
+                return
+            }
             $all = @($script:Existing.Keys | ForEach-Object {
                 $parts = $_ -split '\|', 2
                 [pscustomobject]@{TaskName=$parts[1]; TaskPath=$parts[0]}
@@ -133,7 +141,7 @@ class WindowsUninstallerTests(unittest.TestCase):
         return [e["name"] for e in events if e["kind"] == "unregister"]
 
     def surviving(self, events):
-        return events[-1]["value"]
+        return next(e["value"] for e in reversed(events) if e["kind"] == "scan")
 
     def assert_refused(self, result):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -151,9 +159,8 @@ class WindowsUninstallerTests(unittest.TestCase):
                 self.assertIn("删除 2 个", result.stdout)
                 # Every removal must be followed by its own confirming read.
                 self.assertEqual([(e["kind"], e["name"]) for e in events],
-                                 [("get", DAILY), ("unregister", DAILY), ("get", DAILY),
-                                  ("get", POLL), ("unregister", POLL), ("get", POLL),
-                                  ("scan", "*")])
+                                 [("scan", "*"), ("unregister", DAILY), ("scan", "*"),
+                                  ("unregister", POLL), ("scan", "*")])
                 self.assertEqual([e["value"] for e in events
                                   if e["kind"] == "unregister"], ["\\", "\\"])
 
@@ -174,7 +181,7 @@ class WindowsUninstallerTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("本就未装 2 个", result.stdout)
                 self.assertEqual(self.unregisters(events), [])
-                self.assertEqual([e["kind"] for e in events], ["get", "get", "scan"])
+                self.assertEqual([e["kind"] for e in events], ["scan"])
 
     def test_unregister_failure_is_never_reported_as_complete(self):
         # The other task really did go, and that must not buy a success banner.
@@ -183,7 +190,7 @@ class WindowsUninstallerTests(unittest.TestCase):
                 result, events, _ = self.run_uninstaller(shell, "denied")
                 self.assert_refused(result)
                 self.assertIn("0x80070005", result.stdout)
-                self.assertIn("未完成：1 个任务删除失败", result.stdout)
+                self.assertIn("未完成：1 个任务删除或确认失败", result.stdout)
                 self.assertIn("可手动执行", result.stdout)
                 self.assertIn('-TaskName "WorkBuddyGrowthPoll"', result.stdout)
                 self.assertIn("管理员", result.stdout)
@@ -191,7 +198,23 @@ class WindowsUninstallerTests(unittest.TestCase):
                 self.assertEqual(self.unregisters(events), [DAILY, POLL])
                 # The failing branch continues before its readback.
                 self.assertEqual([(e["kind"], e["name"]) for e in events][-2:],
-                                 [("unregister", POLL), ("scan", "*")])
+                                 [("scan", "*"), ("unregister", POLL)])
+
+    def test_initial_query_failure_refuses_before_removing_tasks(self):
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                result, events, _ = self.run_uninstaller(shell, "query-denied")
+                self.assert_refused(result)
+                self.assertIn("0x80070005", result.stdout)
+                self.assertEqual(self.unregisters(events), [])
+
+    def test_readback_failure_is_not_reported_as_complete(self):
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                result, events, _ = self.run_uninstaller(shell, "readback-denied")
+                self.assert_refused(result)
+                self.assertIn("0x80070005", result.stdout)
+                self.assertTrue(self.unregisters(events))
 
     def test_phantom_success_is_caught_by_readback(self):
         for shell in SHELLS:

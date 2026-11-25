@@ -48,6 +48,7 @@ $fake = New-Module -ArgumentList $TracePath, $Scenario -ScriptBlock {
     $script:ErrorActionPreference = 'Continue'
     $script:TracePath = $TracePath
     $script:Scenario = $Scenario
+    $script:ScanCount = 0
     $script:Existing = [ordered]@{}
     if ($Scenario -ne 'absent') {
         $script:Existing[('\|QoderDailyCredits')] = $true
@@ -67,6 +68,13 @@ $fake = New-Module -ArgumentList $TracePath, $Scenario -ScriptBlock {
     function Get-ScheduledTask {
         [CmdletBinding()] param($TaskName, $TaskPath)
         if (-not $PSBoundParameters.ContainsKey('TaskName')) {
+            $script:ScanCount += 1
+            if (($script:Scenario -eq 'query-denied' -and $script:ScanCount -eq 1) -or
+                ($script:Scenario -eq 'readback-denied' -and $script:ScanCount -eq 2)) {
+                Trace 'scan-failed' '*' @($script:Existing.Keys)
+                Write-Error 'Access is denied (0x80070005)'
+                return
+            }
             $all = @($script:Existing.Keys | ForEach-Object {
                 $parts = $_ -split '\|', 2
                 [pscustomobject]@{TaskName=$parts[1]; TaskPath=$parts[0]}
@@ -129,7 +137,7 @@ class WindowsQoderUninstallerTests(unittest.TestCase):
         return [e["name"] for e in events if e["kind"] == "unregister"]
 
     def surviving(self, events):
-        return events[-1]["value"]
+        return next(e["value"] for e in reversed(events) if e["kind"] == "scan")
 
     def assert_refused(self, result):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
@@ -147,8 +155,7 @@ class WindowsQoderUninstallerTests(unittest.TestCase):
                 self.assertIn("删除 1 个", result.stdout)
                 self.assertIn("install-qoder-windows.ps1", result.stdout)
                 self.assertEqual([(e["kind"], e["name"]) for e in events],
-                                 [("get", QODER), ("unregister", QODER), ("get", QODER),
-                                  ("scan", "*")])
+                                 [("scan", "*"), ("unregister", QODER), ("scan", "*")])
                 self.assertEqual(events[1]["value"], "\\")
 
     def test_never_touches_the_workbuddy_tasks(self):
@@ -167,7 +174,7 @@ class WindowsQoderUninstallerTests(unittest.TestCase):
                 self.assertIn("未安装，跳过", result.stdout)
                 self.assertIn("本就未装 1 个", result.stdout)
                 self.assertEqual(self.unregisters(events), [])
-                self.assertEqual([e["kind"] for e in events], ["get", "scan"])
+                self.assertEqual([e["kind"] for e in events], ["scan"])
 
     def test_unregister_failure_is_never_reported_as_complete(self):
         for shell in SHELLS:
@@ -175,15 +182,31 @@ class WindowsQoderUninstallerTests(unittest.TestCase):
                 result, events, _ = self.run_uninstaller(shell, "denied")
                 self.assert_refused(result)
                 self.assertIn("0x80070005", result.stdout)
-                self.assertIn("未完成：1 个任务删除失败", result.stdout)
+                self.assertIn("未完成：1 个任务删除或确认失败", result.stdout)
                 self.assertIn("可手动执行", result.stdout)
                 self.assertIn('-TaskName "QoderDailyCredits"', result.stdout)
                 self.assertIn("管理员", result.stdout)
                 # Nothing else was removed, so the partial-success note must not appear.
                 self.assertNotIn("已删除的（不会恢复", result.stdout)
                 self.assertEqual([(e["kind"], e["name"]) for e in events][-2:],
-                                 [("unregister", QODER), ("scan", "*")])
+                                 [("scan", "*"), ("unregister", QODER)])
                 self.assertIn("\\|" + QODER, self.surviving(events))
+
+    def test_initial_query_failure_refuses_before_removing_tasks(self):
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                result, events, _ = self.run_uninstaller(shell, "query-denied")
+                self.assert_refused(result)
+                self.assertIn("0x80070005", result.stdout)
+                self.assertEqual(self.unregisters(events), [])
+
+    def test_readback_failure_is_not_reported_as_complete(self):
+        for shell in SHELLS:
+            with self.subTest(shell=shell):
+                result, events, _ = self.run_uninstaller(shell, "readback-denied")
+                self.assert_refused(result)
+                self.assertIn("0x80070005", result.stdout)
+                self.assertTrue(self.unregisters(events))
 
     def test_phantom_success_is_caught_by_readback(self):
         # The dangerous case: the cmdlet returns clean, the scheduler keeps the

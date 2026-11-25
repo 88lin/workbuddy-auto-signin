@@ -56,11 +56,21 @@ $failed = @()
 $removed = @()
 $absent = @()
 
+try {
+    $tasks = @(Get-ScheduledTask -ErrorAction Stop)
+} catch {
+    Write-Host "无法读取计划任务，卸载未执行。" -ForegroundColor Red
+    Write-Host ("  {0}" -f $_.Exception.Message) -ForegroundColor Red
+    exit 1
+}
+
 foreach ($name in $taskNames) {
     Write-Host ("  {0,-22}" -f $name) -NoNewline
     $manual = 'Unregister-ScheduledTask -TaskName "{0}" -TaskPath "{1}" -Confirm:$false' -f $name, $taskPath
 
-    $found = @(Get-ScheduledTask -TaskName $name -TaskPath $taskPath -ErrorAction SilentlyContinue)
+    $found = @($tasks | Where-Object {
+        $_.TaskName -eq $name -and $_.TaskPath -eq $taskPath
+    })
     if ($found.Count -eq 0) {
         Write-Host " 未安装，跳过" -ForegroundColor DarkGray
         $absent += $name
@@ -71,8 +81,9 @@ foreach ($name in $taskNames) {
         # 必须显式 -ErrorAction Stop：ScheduledTasks 模块自带 Continue 偏好，
         # 脚本级的 $ErrorActionPreference 压不住它，失败会退化成非终止错误。
         Unregister-ScheduledTask -TaskName $name -TaskPath $taskPath -Confirm:$false -ErrorAction Stop
+        $tasks = @(Get-ScheduledTask -ErrorAction Stop)
     } catch {
-        Write-Host " 删除失败" -ForegroundColor Red
+        Write-Host " 删除或确认失败" -ForegroundColor Red
         Write-Host ("      {0}" -f $_.Exception.Message) -ForegroundColor Red
         Write-Host "      可手动执行：$manual" -ForegroundColor Yellow
         $failed += $name
@@ -80,7 +91,9 @@ foreach ($name in $taskNames) {
     }
 
     # 回读确认；命令谎报成功、任务其实还在，是最坏的结果。
-    if (@(Get-ScheduledTask -TaskName $name -TaskPath $taskPath -ErrorAction SilentlyContinue).Count -gt 0) {
+    if (@($tasks | Where-Object {
+        $_.TaskName -eq $name -and $_.TaskPath -eq $taskPath
+    }).Count -gt 0) {
         Write-Host " 命令返回成功但任务仍在" -ForegroundColor Red
         Write-Host "      可手动执行：$manual" -ForegroundColor Yellow
         $failed += $name
@@ -94,7 +107,7 @@ foreach ($name in $taskNames) {
 # 同名任务可能注册在别的任务路径下，这里只提醒，不越权去删。
 # MSFT_ScheduledTask 实例上只有 TaskName、没有 Name，而 StrictMode 下取不存在的
 # 属性会直接抛 PropertyNotFound，所以这里必须用 TaskName。
-$elsewhere = @(Get-ScheduledTask -ErrorAction SilentlyContinue |
+$elsewhere = @($tasks |
                Where-Object { $taskNames -contains $_.TaskName -and $_.TaskPath -ne $taskPath })
 if ($elsewhere.Count -gt 0) {
     Write-Host ""
@@ -119,7 +132,7 @@ foreach ($log in $logNames) {
 
 Write-Host ""
 if ($failed.Count -gt 0) {
-    Write-Host ("未完成：{0} 个任务删除失败。" -f $failed.Count) -ForegroundColor Red
+    Write-Host ("未完成：{0} 个任务删除或确认失败。" -f $failed.Count) -ForegroundColor Red
     Write-Host "若是「拒绝访问 / 0x80070005」，请用安装时的同一 Windows 账号，" -ForegroundColor Yellow
     Write-Host "以管理员身份打开 PowerShell 后在本目录重跑本脚本。" -ForegroundColor Yellow
     if ($removed.Count -gt 0) {
