@@ -4,7 +4,8 @@
 # 仓库：https://github.com/88lin/workbuddy-auto-signin
 # 协议：MIT
 #
-# Qoder CN 个人用户每天可在桌面端领取 100 通用 Credits。本脚本只注册一个
+# Qoder CN 试用期、个人付费订阅及有效会员卡用户每天可领取 100 通用 Credits。
+# 免费体验版自 2026 年 11 月 19 日 10:00（UTC+8）起不再开放。本脚本只注册一个
 # 独立的计划任务，不碰 WorkBuddy 的两个任务；登录态由 qoder_signin.py 自动读取。
 #
 # 用法：在本仓库目录下，用 PowerShell 运行
@@ -62,6 +63,8 @@ function Find-Pythonw {
 Write-Host ""
 Write-Host "Qoder CN 每日 Credits · 一键安装" -ForegroundColor Cyan
 Write-Host ("-" * 46) -ForegroundColor DarkGray
+Write-Host "活动资格：试用期、个人付费订阅或有效会员卡；免费体验版不可领取。" -ForegroundColor Yellow
+Write-Host "请先在官方客户端确认活动入口；本安装器不校验领取资格。" -ForegroundColor DarkGray
 
 # --- 1. 定位 pythonw.exe ---
 Write-Host "[1/3] 定位 pythonw.exe ..." -NoNewline

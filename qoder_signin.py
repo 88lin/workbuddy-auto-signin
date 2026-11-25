@@ -4,7 +4,9 @@
 仓库：https://github.com/88lin/workbuddy-auto-signin
 协议：MIT
 
-Qoder CN 个人用户每天可在桌面端领取 100 通用 Credits。活动按 UTC+8 每天
+Qoder CN 符合活动资格的个人账号每天可领取 100 通用 Credits。自 2026 年
+11 月 19 日 10:00（UTC+8）起，仅试用期、个人付费订阅及有效会员卡用户可领，
+免费体验版不再开放；此前已领取的奖励保留原有 30 天有效期。活动按 UTC+8 每天
 10:00 刷新，没有补领。本脚本只读取本机 Qoder CN 桌面端的登录态，零内置密钥：
 
   GET  {base}/sash/api/v1/me/campaigns
@@ -81,6 +83,8 @@ FAILURE_RESULTS = (
     "AUTH_REJECTED", "FORBIDDEN", "PENDING",
 )
 QUIET_RESULTS = ("ALREADY", "INACTIVE")
+ELIGIBILITY_HINT = ("请核对活动资格及账号权限；每日 100 Credits 适用于试用期、"
+                    "个人付费订阅及有效会员卡用户，免费体验版不适用")
 
 
 class QoderAuthError(Exception):
@@ -867,7 +871,7 @@ def _claim_all(api, campaigns, retry):
                            http=code, campaign=key)
         if code == 403:
             return _result("FORBIDDEN",
-                           "领取被服务端拒绝（HTTP 403），请确认账号资格后重试",
+                           "领取被服务端拒绝（HTTP 403），" + ELIGIBILITY_HINT,
                            http=code, campaign=key)
         data = body.get("data") if isinstance(body, dict) and isinstance(body.get("data"), dict) \
             else body
@@ -907,7 +911,8 @@ def claim_once(api, retry=True, dry_run=False):
                        "登录态被服务端拒绝（HTTP 401），请打开 Qoder CN 桌面端重新登录",
                        http=code)
     if code == 403:
-        return _result("FORBIDDEN", "查询被服务端拒绝（HTTP 403），请稍后重试", http=code)
+        return _result("FORBIDDEN", "查询被服务端拒绝（HTTP 403），" + ELIGIBILITY_HINT,
+                       http=code)
     if code == 0:
         return _result("NETWORK", "网络请求失败：%s" % _short(err), http=0)
     if code != 200 or not isinstance(payload, dict):
@@ -944,7 +949,8 @@ def claim_once(api, retry=True, dry_run=False):
         return _result("PENDING", "活动存在但当前不可领取：%s" % "；".join(rows),
                        http=code)
 
-    return _result("INACTIVE", "当前没有可领取的 Credits 活动（活动可能已结束）", http=code)
+    return _result("INACTIVE", "当前没有可领取的 Credits 活动（可能未开放、已结束或账号不符合资格）",
+                   http=code)
 
 
 # ---------------------------------------------------------------- 输出
@@ -1060,7 +1066,8 @@ def run_status(api):
                        "登录态被服务端拒绝（HTTP 401），请打开 Qoder CN 桌面端重新登录",
                        http=code), 1
     if code == 403:
-        return _result("FORBIDDEN", "查询被服务端拒绝（HTTP 403）", http=code), 1
+        return _result("FORBIDDEN", "查询被服务端拒绝（HTTP 403），" + ELIGIBILITY_HINT,
+                       http=code), 1
     if code == 0:
         return _result("NETWORK", "网络请求失败：%s" % _short(err), http=0), 1
     if code != 200 or not isinstance(payload, dict):

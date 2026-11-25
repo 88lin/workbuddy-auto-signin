@@ -14,9 +14,9 @@
 
 </div>
 
-> 两个自包含的 Python 脚本，每天分别帮你领取 **WorkBuddy**（腾讯 AI 编程助手）的签到积分和 **Qoder CN** 的 100 通用 Credits。两者都只读取你自己机器上的登录态，零内置密钥，可安全分享。
+> 两个自包含的 Python 脚本，每天分别帮你领取 **WorkBuddy**（腾讯 AI 编程助手）的签到积分和符合活动资格的 **Qoder CN** 账号的 100 通用 Credits。两者都只读取你自己机器上的登录态，零内置密钥，可安全分享。
 >
-> Qoder CN 是可选的独立功能，Windows 下可一键安装独立计划任务，不影响 WorkBuddy；详见[可选：Qoder CN](#qoder-cn)。
+> Qoder CN 是可选的独立功能，需处于试用期、个人付费订阅或有效会员卡状态。免费体验版自 **2026 年 11 月 19 日 10:00（UTC+8）** 起不再开放领取，此前已领取的 Credits 在各自 30 天有效期内继续可用。Windows 下可一键安装独立计划任务，不影响 WorkBuddy；详见[可选：Qoder CN](#qoder-cn)。
 >
 > 👤 作者：[88lin](https://dev.88lin.eu.org/) · 📦 仓库：[github.com/88lin/workbuddy-auto-signin](https://github.com/88lin/workbuddy-auto-signin)
 
@@ -66,7 +66,7 @@
 - ✅ 本机有 **Python 3**（任意版本，无需任何第三方包）
 - ✅ Windows 用模式 B 定时（含 Qoder CN）需要 **Windows 8 及以上**：`.ps1` 依赖系统自带的 `ScheduledTasks` 模块，Windows 7 没有这个组件、升级 PowerShell 也补不上，`schtasks.exe` 不是同一套。实测环境是 Windows 10 22H2 + Windows PowerShell 5.1；Windows 11 只在 CI 里跑过，未做真机验证
 - ⬜ 可选：装了 `git` 就能直接 `clone`；没有的话去仓库页面 **Code → Download ZIP** 解压，效果一样
-- 🎁 可选：想顺便自动领 **Qoder CN** 的每日 100 Credits，需已登录 Qoder CN 桌面端；见[可选：Qoder CN](#qoder-cn)
+- 🎁 可选：想顺便自动领 **Qoder CN** 的每日 100 Credits，需已登录 Qoder CN 桌面端且符合活动资格；见[可选：Qoder CN](#qoder-cn)
 
 ---
 
@@ -477,16 +477,20 @@ Windows 按 `WORKBUDDY_EXE → 默认安装目录 → 注册表` 的顺序发现
 
 ## 🎁 可选：Qoder CN 每日 100 Credits
 
-同一个仓库还附带一个**独立**的 `qoder_signin.py`：自动领取 [Qoder CN](https://docs.qoder.cn/events/100credits) 个人用户每天 100 通用 Credits。它和 WorkBuddy 脚本、两个 WorkBuddy 定时任务互不影响，可以只装其中一个。
+同一个仓库还附带一个**独立**的 `qoder_signin.py`：为符合活动资格的 [Qoder CN](https://docs.qoder.cn/events/100credits) 个人账号自动领取每日 100 通用 Credits。它和 WorkBuddy 脚本、两个 WorkBuddy 定时任务互不影响，可以只装其中一个。
 
 活动规则（以官方页面为准）：
 
 - 每天 **10:00（UTC+8）** 刷新，每个窗口可领 **100 Credits**，领取后 **30 天**有效
-- 仅限个人用户；**没有补领**，错过当天窗口就没了
+- 适用用户：**试用期用户、专业版/高级版/旗舰版个人付费订阅用户，以及有效会员卡用户**
+- **免费体验版自 2026 年 11 月 19 日 10:00（UTC+8）起不再开放领取**；团队版及企业订阅用户也不适用
+- 调整前已领取的 Credits 不会被收回，各笔奖励在原有 30 天有效期内继续可用；试用、订阅或会员卡失效后，从下一轮起不再符合领取条件
+- **没有补领**，错过当天窗口就没了
 - 领取接口幂等：同一窗口重复调用只返回已领取，不会多发
 
 ### 前置条件
 
+- 账号处于**试用期、个人付费订阅或有效会员卡状态**
 - 已安装并**登录过 Qoder CN 桌面端**（Windows / macOS）
 - 本机有 **Python 3**（与 WorkBuddy 共用即可，无第三方包）
 
@@ -498,6 +502,9 @@ Windows 按 `WORKBUDDY_EXE → 默认安装目录 → 注册表` 的顺序发现
 >   所以同样不需要 `pip install`。
 >
 > Linux 暂无自动读取，可设 `QODER_TOKEN`，但令牌会过期，不推荐长期保存。
+
+> [!NOTE]
+> 免费体验版用户可使用本节下方的卸载命令停止 Qoder 每日领取任务。资格调整后反复重新登录不会恢复领取资格。`doctor` 只检查本地登录态和设备组件，不校验活动资格；资格以官方客户端及服务端当前返回为准。
 
 ### 一键安装（Windows）
 
