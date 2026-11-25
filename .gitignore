@@ -9,3 +9,9 @@ signin.log
 qoder_signin.log
 # 多账号凭据快照：本机登录凭据副本，绝不能提交
 accounts/
+
+# Qoder credits watchdog（config 含推送主题，等同于口令；state/heartbeat/log 是本机运行时数据）
+qoder-watch-config.json
+qoder-watch-state.json
+qoder-watch-heartbeat.json
+qoder-watch.log
