@@ -1802,6 +1802,111 @@ def _already_report(status, via=None):
     }
 
 
+# 任务奖领取开关。赠送的积分有效期只有一个月，一次性任务奖如果全部集中到账，
+# 很容易在到期前用不完；这里让领取可以按时间摊开。两种控制方式，优先级从高到低：
+#   1) pause_task_claim 文件存在 → 一直暂停，直到删掉该文件
+#   2) task_claim_after 里写一个日期（YYYY-MM-DD）→ 该日期之前暂停，
+#      当天及以后自动恢复领取
+# 暂停期间脚本仍会接单、领旅行礼物、连登兑换、开盲盒，只是不把已完成任务的奖领走。
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_TASK_CLAIM_FLAG = os.path.join(_BASE_DIR, "pause_task_claim")
+_TASK_CLAIM_AFTER = os.path.join(_BASE_DIR, "task_claim_after")
+
+
+def _task_claim_state():
+    """返回 (是否暂停, 汇报文案)。任何读取/解析失败都按"不暂停"处理，避免静默卡死领取。"""
+    if os.path.exists(_TASK_CLAIM_FLAG):
+        return True, "任务奖领取已暂停（pause_task_claim 存在），已完成任务留待手动领取"
+    try:
+        with open(_TASK_CLAIM_AFTER, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+    except OSError:
+        return False, ""
+    if not raw:
+        return False, ""
+    norm = raw.replace("/", "-").replace(".", "-")
+    try:
+        y, m, d = (int(x) for x in norm.split("-")[:3])
+        target = date(y, m, d)
+    except Exception:
+        return False, "task_claim_after 内容无法解析（%s），按自动领取处理" % raw
+    today = date.today()
+    if today < target:
+        return True, ("任务奖领取定时暂停：%s 起自动领取（今天 %s），"
+                      "已完成任务暂不领取" % (target.isoformat(), today.isoformat()))
+    return False, ""
+
+
+def _task_claim_paused():
+    """只看是否处于暂停状态（需要文案时用 _task_claim_state）。"""
+    return _task_claim_state()[0]
+
+
+# 每月任务奖领取上限（积分）。配合 task_claim_after 使用，可以把一次性任务奖按
+# 月份摊开发放。状态记在 task_claim_state.json，跨自然月自动归零。
+_TASK_QUOTA_FILE = os.path.join(_BASE_DIR, "task_claim_quota")
+_TASK_QUOTA_STATE = os.path.join(_BASE_DIR, "task_claim_state.json")
+# 活动结束日。进入它的最后一个月后配额自动失效——配额按自然月归零，若最后一个月
+# 仍受限，剩余额度只能等到下个月才放开，那时活动已经结束，等于白白作废。
+_TASK_DEADLINE_FILE = os.path.join(_BASE_DIR, "task_claim_deadline")
+
+
+def _task_claim_deadline():
+    """活动结束日；文件缺失或无法解析时返回 None（不做最后一个月放开）。"""
+    try:
+        with open(_TASK_DEADLINE_FILE, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+    except OSError:
+        return None
+    norm = raw.replace("/", "-").replace(".", "-")
+    try:
+        y, m, d = (int(x) for x in norm.split("-")[:3])
+        return date(y, m, d)
+    except Exception:
+        return None
+
+
+def _task_claim_quota():
+    """本月任务奖领取上限（积分）。文件缺失/为 0/内容非法 = 不限额。"""
+    try:
+        with open(_TASK_QUOTA_FILE, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+    except OSError:
+        return 0
+    try:
+        v = int(float(raw))
+    except ValueError:
+        return 0
+    if v <= 0:
+        return 0
+    deadline = _task_claim_deadline()
+    if deadline and date.today() >= date(deadline.year, deadline.month, 1):
+        return 0   # 活动最后一个月：解除上限，避免剩余额度跨不过活动结束日
+    return v
+
+
+def _task_claim_quota_state():
+    """{'month': 'YYYY-MM', 'claimed': 本月已领积分}；月份变化自动清零。"""
+    month = date.today().strftime("%Y-%m")
+    try:
+        with open(_TASK_QUOTA_STATE, "r", encoding="utf-8") as f:
+            st = json.load(f)
+    except Exception:
+        st = {}
+    if (not isinstance(st, dict) or st.get("month") != month
+            or not isinstance(st.get("claimed"), int)):
+        st = {"month": month, "claimed": 0}
+    return st
+
+
+def _save_task_claim_quota_state(st):
+    try:
+        with open(_TASK_QUOTA_STATE, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
 def run_growth(headers, endpoint):
     """成长中心自动化：领旅行礼物→领任务→补登→连登兑换→开盲盒→能量开 Buddy→派出→汇报。
 
@@ -1953,12 +2058,28 @@ def run_growth(headers, endpoint):
                         else:
                             parts.append("领取任务「%s」（进度开始计）" % title)
                             successes += 1
+                _claim_paused, _claim_note = _task_claim_state()
+                if _claim_paused and _claim_note:
+                    parts.append(_claim_note)
+                _quota = _task_claim_quota()
+                _qstate = _task_claim_quota_state()
                 for t in tasks:
+                    if _claim_paused:
+                        break
                     if _budget_left() <= 0:
                         parts.append("时间预算耗尽，剩余任务奖下次再领")
                         break
                     if t.get("locked") or t.get("accept_status") != "completed":
                         continue   # 只有 completed 才发奖，且走独立路径
+                    if _quota:
+                        _used = _qstate.get("claimed", 0)
+                        if _used >= _quota:
+                            parts.append("本月任务奖已领满 %s 分（已领 %s），剩余留到下月"
+                                         % (_quota, _used))
+                            break
+                        # 单笔太大就跳过，先领放得下的小额，别把配额撑爆
+                        if _used + as_int(t.get("reward_credit"), 0) > _quota:
+                            continue
                     code = t.get("task_code")
                     title = titles.get(code, code)
                     try:
@@ -1971,6 +2092,9 @@ def run_growth(headers, endpoint):
                             rc = _first_int(cbody, "credit", t.get("reward_credit"))
                             re_ = _first_int(cbody, "energy", t.get("reward_energy"))
                             credits_gained += rc
+                            if _quota:
+                                _qstate["claimed"] = _qstate.get("claimed", 0) + rc
+                                _save_task_claim_quota_state(_qstate)
                             parts.append("领任务奖「%s」+credit%s+energy%s" % (title, rc, re_))
                             successes += 1
                         elif 200 <= ccode < 300:

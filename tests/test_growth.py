@@ -471,5 +471,138 @@ class BuddyLifecycleTests(unittest.TestCase):
         self.assertIn("派 Buddy 跳过", out["report"])
 
 
+class TaskClaimControlTests(unittest.TestCase):
+    """任务奖的暂停开关与月度配额：只影响领奖，不影响接单等其余动作。"""
+
+    TASK_TEMPLATE = [
+        {"task_code": "small_a", "title": "小任务 A", "accept_status": "completed",
+         "reward_credit": 100},
+        {"task_code": "small_b", "title": "小任务 B", "accept_status": "completed",
+         "reward_credit": 100},
+        {"task_code": "small_c", "title": "小任务 C", "accept_status": "completed",
+         "reward_credit": 100},
+        {"task_code": "big", "title": "大任务", "accept_status": "completed",
+         "reward_credit": 500},
+    ]
+
+    def setUp(self):
+        self.TASKS = copy.deepcopy(self.TASK_TEMPLATE)
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        root = Path(self.dir.name)
+        self.paths = {
+            "flag": root / "pause_task_claim",
+            "after": root / "task_claim_after",
+            "quota": root / "task_claim_quota",
+            "state": root / "task_claim_state.json",
+            "deadline": root / "task_claim_deadline",
+        }
+        for attr, key in (("_TASK_CLAIM_FLAG", "flag"), ("_TASK_CLAIM_AFTER", "after"),
+                          ("_TASK_QUOTA_FILE", "quota"), ("_TASK_QUOTA_STATE", "state"),
+                          ("_TASK_DEADLINE_FILE", "deadline")):
+            patcher = patch.object(signin, attr, str(self.paths[key]))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.accepted = []
+        self.claimed = []
+        get_patch = patch.object(signin, "get", side_effect=self.get)
+        post_patch = patch.object(signin, "post", side_effect=self.post)
+        get_patch.start()
+        post_patch.start()
+        self.addCleanup(get_patch.stop)
+        self.addCleanup(post_patch.stop)
+
+    def get(self, url, headers):
+        path = url.split("/v2/activity/growth", 1)[1]
+        if path == "/buddy/travel/status":
+            return response({"state": "idle", "daily_limit_reached": True})
+        if path == "/tasks":
+            return response({"tasks": copy.deepcopy(self.TASKS)})
+        if path == "/streak":
+            return response({"streak": {"days": 1}, "makeup_cards": {"balance": 0}})
+        if path == "/redeem/summary":
+            return response({tier + "_status": "locked"
+                             for tier in ("starter", "advanced", "legendary")})
+        if path == "/lottery/chances":
+            return response({"balance": 0})
+        if path == "/buddy/quota":
+            return response({"affordable": 0})
+        if path == "/energy":
+            return response({"balance": 0})
+        self.fail("Unexpected GET: " + path)
+
+    def post(self, url, headers, payload=None, **kwargs):
+        path = url.split("/v2/activity/growth", 1)[1]
+        if path == "/tasks/accept":
+            self.accepted.extend(payload["task_codes"])
+            return response({"results": [{"task_code": code, "status": "ok"}
+                                         for code in payload["task_codes"]]})
+        if path.startswith("/tasks/") and path.endswith("/claim"):
+            code = path.split("/")[2]
+            self.claimed.append(code)
+            reward = next(t["reward_credit"] for t in self.TASKS if t["task_code"] == code)
+            return response({"credit": reward})
+        self.fail("Unexpected POST: " + path)
+
+    def run_growth(self):
+        signin._start_budget()
+        return signin.run_growth({}, "https://test.invalid")
+
+    def write(self, key, text):
+        self.paths[key].write_text(text, encoding="utf-8")
+
+    def test_pause_flag_skips_task_rewards_but_not_accepting(self):
+        self.TASKS[0]["accept_status"] = "not_accepted"
+        self.paths["flag"].touch()
+        code, out = self.run_growth()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.claimed, [])
+        self.assertIn("small_a", self.accepted)
+        self.assertIn("已暂停", out["report"])
+
+    def test_future_date_pauses_and_past_date_resumes(self):
+        from datetime import date, timedelta
+        self.write("after", (date.today() + timedelta(days=3)).isoformat())
+        _, out = self.run_growth()
+        self.assertEqual(self.claimed, [])
+        self.assertIn("定时暂停", out["report"])
+
+        self.write("after", (date.today() - timedelta(days=1)).isoformat())
+        self.run_growth()
+        self.assertEqual(self.claimed, ["small_a", "small_b", "small_c", "big"])
+
+    def test_invalid_date_does_not_block_claims(self):
+        self.write("after", "not-a-date")
+        self.run_growth()
+        self.assertEqual(len(self.claimed), 4)
+
+    def test_monthly_quota_stops_after_limit_and_skips_oversized_rewards(self):
+        self.write("quota", "300")
+        _, out = self.run_growth()
+        self.assertEqual(self.claimed, ["small_a", "small_b", "small_c"])
+        self.assertIn("本月任务奖已领满 300 分", out["report"])
+        self.assertEqual(json.loads(self.paths["state"].read_text())["claimed"], 300)
+
+    def test_quota_state_from_previous_month_starts_over(self):
+        self.write("quota", "300")
+        self.write("state", json.dumps({"month": "2026-01", "claimed": 300}))
+        self.run_growth()
+        self.assertEqual(len(self.claimed), 3)
+        self.assertEqual(json.loads(self.paths["state"].read_text())["claimed"], 300)
+
+    def test_last_month_of_activity_lifts_the_quota(self):
+        from datetime import date
+        self.write("quota", "100")
+        self.write("deadline", date.today().replace(day=1).isoformat())
+        self.run_growth()
+        self.assertEqual(len(self.claimed), 4)
+
+    def test_oversized_single_reward_is_skipped_before_quota_is_full(self):
+        self.write("quota", "250")
+        self.TASKS[:] = [t for t in self.TASKS if t["task_code"] != "big"]
+        self.run_growth()
+        self.assertEqual(self.claimed, ["small_a", "small_b"])
+
+
 if __name__ == "__main__":
     unittest.main()

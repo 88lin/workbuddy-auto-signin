@@ -9,3 +9,6 @@ signin.log
 qoder_signin.log
 # 多账号凭据快照：本机登录凭据副本，绝不能提交
 accounts/
+
+# 任务奖月度配额的运行时累计
+task_claim_state.json
