@@ -425,6 +425,7 @@ Windows 按 `WORKBUDDY_EXE → 默认安装目录 → 注册表` 的顺序发现
 | `WORKBUDDY_ACCOUNTS_DIR` | 多账号清单与凭据副本的存放目录（默认脚本同目录的 `accounts/`）。目录里是本机登录凭据副本，建议放在只允许自己访问的位置 |
 | `WORKBUDDY_EXE` | 指定与加密凭据对应的客户端**可执行文件**；Windows 为 `WorkBuddy.exe`（AI 版为 `WorkBuddyAI.exe`），macOS 为 `.app/Contents/MacOS/` 内实际可执行文件。路径错误时直接报告，不静默回退 |
 | `WORKBUDDY_SIGNIN_LOG` | `silent` 模式下日志文件路径（默认 `signin.log`） |
+| `WORKBUDDY_SERVERCHAN_SENDKEY` | 可选：Server酱 Turbo / Server酱³ 的 SendKey；配置后，`auto` / `silent` 每次执行发送一条脱敏汇报 |
 | `WORKBUDDY_BUDGET_SECONDS` | 单次运行的网络请求时间预算。签到类命令默认 `420`（7 分钟）、上限 `540`；`silent-poll` / `silent-growth` 轮询默认 `180`、上限 `240`。**Windows 上须为正数且小于对应计划任务的 `ExecutionTimeLimit`**（macOS launchd 无此限制）。非法值、`≤0` 或超上限都会夹到安全值，并在输出里附 `config_warning` |
 | `WORKBUDDY_GROWTH_LOG_EMPTY` | 设为 `1`（或 `true`/`yes`/`on`）时，`silent-poll` 连空跑也写日志；默认只在领到东西或出错时记录 |
 
@@ -434,6 +435,32 @@ Windows 按 `WORKBUDDY_EXE → 默认安装目录 → 注册表` 的顺序发现
 > 若你要调整某个任务的 `ExecutionTimeLimit`，须同步改 `signin.py` 顶部对应的 `MAX_BUDGET_SECONDS` / `POLL_MAX_BUDGET_SECONDS`（分别对应签到任务与轮询任务）。
 >
 > macOS 的 launchd **没有** `ExecutionTimeLimit` 这类外部时限，不会把跑久了的任务强杀，所以上面的上限只是 Windows 侧的约束；macOS 上脚本内置的时间预算就是唯一的兜底，保持默认即可。
+
+---
+
+## 📲 可选：Server酱每日签到通知
+
+Linux 小主机可以用 cron 直接运行脚本，并通过 [Server酱 Turbo](https://sct.ftqq.com/) 或 [Server酱³](https://sc3.ft07.com/) 接收每日签到汇报。先在对应平台配置接收渠道并取得 SendKey，再将它设置到运行 `signin.py` 的环境中。无需安装额外 Python 包，脚本仍可单文件部署。
+
+手动运行示例：
+
+```bash
+export WORKBUDDY_SERVERCHAN_SENDKEY='替换为你的 SendKey'
+python3 /你的路径/workbuddy-auto-signin/signin.py auto
+```
+
+cron 不会自动继承终端里临时 export 的变量。可在 `crontab -e` 中给每日任务配置：
+
+```cron
+WORKBUDDY_SERVERCHAN_SENDKEY=替换为你的SendKey
+5 0 * * * /usr/bin/python3 /你的路径/workbuddy-auto-signin/signin.py silent
+```
+
+- 不配置 SendKey 时不发送通知。`SCT...` 使用 Turbo，`sctp<用户编号>t...` 使用 Server酱³ 的官方接口。
+- 仅 `auto` / `silent` 发送：成功、已签过、无活动或失败都会汇报；多账号轮转后汇总成一条。普通轮询、查询、自检和账号管理命令不推送。
+- 每次执行发送一次，不做跨次去重。重复运行或用 `auto` 做成长轮询会增加消息数，请按渠道额度安排频率。
+- 发送内容取自脱敏后的 `report`，可能含账号别名；不发送完整接口响应或认证请求头。SendKey 应保存在本机配置中，不要提交到仓库。
+- 推送请求的超时为 5 秒，不重试。失败时在本地输出或日志里附 `notification_warning`，签到结果和退出码保持原有含义。
 
 ---
 

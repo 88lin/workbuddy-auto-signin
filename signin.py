@@ -1771,6 +1771,49 @@ def _dumps(out):
         return repr(out)
 
 
+def _redact(text):
+    for value in sorted(_sensitive_values, key=len, reverse=True):
+        text = text.replace(value, "[REDACTED]")
+        escaped = json.dumps(value, ensure_ascii=False)[1:-1]
+        if escaped != value:
+            text = text.replace(escaped, "[REDACTED]")
+    return text
+
+
+def _serverchan_notify(report):
+    key = (os.environ.get("WORKBUDDY_SERVERCHAN_SENDKEY") or "").strip()
+    if key:
+        _sensitive_values.add(key)
+    if not key or not isinstance(report, str) or not report.strip():
+        return None
+    try:
+        if len(key) > 512 or re.search(r"[\s\x00-\x1f\x7f]", key):
+            return "Server酱 SendKey 格式无效，请检查配置"
+        encoded_key = urllib.parse.quote(key, safe="")
+        if key.startswith("sctp"):
+            match = re.fullmatch(r"sctp([0-9]{1,63})t.+", key)
+            if not match:
+                return "Server酱 SendKey 格式无效，请检查配置"
+            url = "https://%s.push.ft07.com/send/%s.send" % (match.group(1), encoded_key)
+        elif key.startswith("SCT") and len(key) > 3:
+            url = "https://sctapi.ftqq.com/%s.send" % encoded_key
+        else:
+            return "Server酱 SendKey 格式无效，请检查配置"
+        request = urllib.request.Request(
+            url, method="POST",
+            data=_dumps({"title": "WorkBuddy 每日签到", "desp": _redact(report)}).encode("utf-8"),
+            headers={"Content-Type": "application/json;charset=utf-8"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            body = json.loads(response.read(8192).decode("utf-8"))
+            code = body.get("code") if isinstance(body, dict) else None
+            if 200 <= response.status < 300 and type(code) is int and code == 0:
+                return None
+    except Exception:
+        pass  # 第三方错误可能带 SendKey，只返回固定提示。
+    return "Server酱推送失败，请检查网络、额度及 SendKey 配置"
+
+
 def emit(out, action):
     """silent 类模式写日志文件，其余模式打印到 stdout；本函数保证不抛异常。
 
@@ -1789,9 +1832,11 @@ def emit(out, action):
             "AUTH_ERROR", "AUTH_REJECTED", "FORBIDDEN"))
     if _config_warning and isinstance(out, dict):
         out = dict(out, config_warning=_config_warning)
-    payload = _dumps(out)
-    for value in _sensitive_values:
-        payload = payload.replace(value, "[REDACTED]")
+    if isinstance(out, dict) and action in ("auto", "silent"):
+        warning = _serverchan_notify(out.get("report"))
+        if warning:
+            out["notification_warning"] = warning
+    payload = _redact(_dumps(out))
     is_error = isinstance(out, dict) and out.get("result") == "ERROR"
     if not str(action).startswith("silent"):
         try:
