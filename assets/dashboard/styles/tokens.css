@@ -1,0 +1,67 @@
+/* Design tokens — 数字原生的现代界面
+   白色表面 + 柔和分层阴影 + 明确品牌色；不依赖纸感或发丝线。 */
+
+:root {
+  color-scheme: light;
+
+  /* 表面 */
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-subtle: #fafbfc;
+  --border: #e8eaee;
+  --border-strong: #d5d9e0;
+
+  /* 文字 */
+  --text: #16181d;
+  --text-2: #646b76;
+  --text-3: #99a0aa;
+
+  /* 品牌 */
+  --brand: #3a5ccc;
+  --brand-hover: #2d4aa8;
+  --brand-soft: #eef2ff;
+
+  /* 状态 */
+  --ok: #12854a;
+  --ok-soft: #e9f7ef;
+  --warn: #b0760b;
+  --warn-soft: #fff5e2;
+  --err: #cf3a36;
+  --err-soft: #fdeceb;
+
+  /* 字体 */
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --mono: "SF Mono", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+
+  /* 字阶 */
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-base: 14px;
+  --fs-lg: 18px;
+  --fs-xl: 24px;
+  --fs-balance: 29px;
+
+  /* 间距 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-7: 32px;
+  --sp-8: 48px;
+
+  /* 圆角与阴影 */
+  --r-lg: 14px;
+  --r-md: 10px;
+  --r-sm: 7px;
+  --r-pill: 999px;
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.04),
+    0 12px 28px -12px rgba(16, 24, 40, 0.12);
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.05);
+
+  /* 动效 */
+  --ease: 160ms cubic-bezier(0.2, 0.7, 0.3, 1);
+}

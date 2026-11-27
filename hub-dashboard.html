@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%233a5ccc'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white'%3EW%3C/text%3E%3C/svg%3E"
+    />
+    <title>WorkBuddy 统一控制台</title>
+    <link rel="stylesheet" href="/assets/dashboard/styles/tokens.css" />
+    <link rel="stylesheet" href="/assets/dashboard/styles/base.css" />
+    <link rel="stylesheet" href="/assets/dashboard/styles/layout.css" />
+    <link rel="stylesheet" href="/assets/dashboard/styles/components.css" />
+  </head>
+  <body>
+    <div class="page">
+      <header class="page__header">
+        <div>
+          <h1 class="page__title">WorkBuddy 统一控制台</h1>
+          <p class="page__subtitle">账号、积分与会话跟随，集中在一处</p>
+        </div>
+        <div class="page__aside">
+          <div class="status" id="status" data-state="loading" role="status">
+            <span class="status__dot" aria-hidden="true"></span>
+            <span data-role="label">连接中</span>
+          </div>
+          <span class="mono" id="updated-at">—</span>
+        </div>
+      </header>
+
+      <div class="banner" id="banner" role="alert" hidden>
+        <div class="banner__text">
+          <div class="banner__title">无法连接控制台</div>
+          <div class="banner__detail" id="banner-detail"></div>
+        </div>
+        <button class="btn btn--secondary btn--small" id="retry" type="button">
+          重试
+        </button>
+      </div>
+
+      <div class="toolbar" id="toolbar">
+        <button class="btn btn--secondary" data-action="sync" type="button">
+          会话同步
+        </button>
+        <button class="btn btn--secondary" data-action="balance" type="button">
+          余额刷新
+        </button>
+        <button class="btn btn--secondary" data-action="pause" type="button">
+          暂停监控
+        </button>
+        <span class="toolbar__spacer"></span>
+        <button class="btn btn--quiet" data-action="open/backups" type="button">
+          备份目录
+        </button>
+        <button class="btn btn--quiet" data-action="open/log" type="button">
+          完整日志
+        </button>
+        <span class="toolbar__note">每 3 秒刷新</span>
+      </div>
+
+      <div class="layout">
+        <section class="card" id="ledger" aria-labelledby="ledger-title">
+          <div class="card__head">
+            <h2 class="card__title" id="ledger-title">账号</h2>
+            <span class="card__meta">切换会同步搬移会话</span>
+          </div>
+          <div class="ledger__labels" aria-hidden="true">
+            <span>账号</span>
+            <span>当前积分</span>
+            <span>最近到期</span>
+            <span>会话</span>
+            <span></span>
+          </div>
+          <ul class="ledger__list">
+            <li class="account skeleton-row" aria-hidden="true">
+              <div class="skeleton" style="width: 76px"></div>
+              <div class="skeleton" style="width: 38px; height: 26px"></div>
+              <div class="skeleton" style="width: 118px"></div>
+              <div class="skeleton" style="width: 26px"></div>
+              <div></div>
+            </li>
+            <li class="account skeleton-row" aria-hidden="true">
+              <div class="skeleton" style="width: 62px"></div>
+              <div class="skeleton" style="width: 38px; height: 26px"></div>
+              <div class="skeleton" style="width: 104px"></div>
+              <div class="skeleton" style="width: 26px"></div>
+              <div></div>
+            </li>
+            <li class="account skeleton-row" aria-hidden="true">
+              <div class="skeleton" style="width: 70px"></div>
+              <div class="skeleton" style="width: 38px; height: 26px"></div>
+              <div class="skeleton" style="width: 112px"></div>
+              <div class="skeleton" style="width: 26px"></div>
+              <div></div>
+            </li>
+          </ul>
+        </section>
+
+        <aside class="card" aria-labelledby="summary-title">
+          <div class="card__head">
+            <h2 class="card__title" id="summary-title">当前状态</h2>
+          </div>
+          <div class="summary" id="summary">
+            <div class="summary__row">
+              <span class="summary__key">客户端登录</span>
+              <span class="summary__val" data-role="current">—</span>
+            </div>
+            <div class="summary__row">
+              <span class="summary__key">客户端进程</span>
+              <span class="summary__val" data-role="clients">—</span>
+            </div>
+            <div class="summary__row">
+              <span class="summary__key">最近操作</span>
+              <span class="summary__val" data-role="last-action">—</span>
+            </div>
+            <div class="summary__row">
+              <span class="summary__key">最近成功同步</span>
+              <span class="summary__val" data-role="last-sync">—</span>
+            </div>
+            <div class="summary__row">
+              <span class="summary__key">余额更新于</span>
+              <span class="summary__val" data-role="balances-at">—</span>
+            </div>
+            <div class="summary__row">
+              <span class="summary__key">错误</span>
+              <span class="summary__val" data-role="last-error">—</span>
+            </div>
+          </div>
+          <details class="help">
+            <summary>换号与会话跟随说明</summary>
+            <p>
+              切换会先关闭客户端并备份当前登录态，写回目标账号快照，再把其他账号的会话搬过去。
+              手动在客户端换号时，会话也会自动跟随。
+            </p>
+            <p>换号瞬间客户端会被强制关闭重开，未保存的编辑会丢失。</p>
+          </details>
+        </aside>
+      </div>
+
+      <section class="card" aria-labelledby="log-title">
+        <div class="card__head">
+          <h2 class="card__title" id="log-title">运行日志</h2>
+          <span class="card__meta">最近 60 行</span>
+        </div>
+        <div class="log-wrap">
+          <pre class="log" id="log" aria-live="polite"></pre>
+        </div>
+      </section>
+    </div>
+
+    <div class="toast-stack" id="toasts" aria-live="polite"></div>
+
+    <dialog class="confirm" id="confirm" aria-labelledby="confirm-title">
+      <div class="confirm__body">
+        <h2 class="confirm__title" id="confirm-title" data-role="title"></h2>
+        <p class="confirm__text" data-role="text"></p>
+      </div>
+      <div class="confirm__actions">
+        <button class="btn btn--quiet" data-action="cancel" type="button">取消</button>
+        <button class="btn btn--primary" data-action="accept" type="button">
+          确认切换
+        </button>
+      </div>
+    </dialog>
+
+    <script type="module" src="/assets/dashboard/js/app.js"></script>
+  </body>
+</html>

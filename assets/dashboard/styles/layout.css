@@ -1,0 +1,68 @@
+/* 页面骨架：头部 / 操作条 / 主内容 / 活动记录 */
+
+.page {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: var(--sp-7) var(--sp-6) var(--sp-8);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+}
+
+.page__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--sp-4);
+}
+
+.page__title {
+  font-size: var(--fs-xl);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.25;
+}
+
+.page__subtitle {
+  margin-top: var(--sp-1);
+  color: var(--text-2);
+  font-size: var(--fs-base);
+}
+
+.page__aside {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  color: var(--text-3);
+  font-size: var(--fs-sm);
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: var(--sp-5);
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 600px) {
+  .page {
+    padding: var(--sp-5) var(--sp-4) var(--sp-7);
+    gap: var(--sp-5);
+  }
+
+  .page__title {
+    font-size: var(--fs-lg);
+  }
+
+  .page__aside {
+    width: 100%;
+    justify-content: space-between;
+  }
+}
