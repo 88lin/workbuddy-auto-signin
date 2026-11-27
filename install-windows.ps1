@@ -18,9 +18,17 @@
 
 $ErrorActionPreference = "Stop"
 
-# ====== 一般不用改；自动探测失败时手动填这两个 ======
-$ManualPythonw = ""   # 例如 C:\Python313\pythonw.exe
-$ManualSignin  = ""   # 例如 C:\Users\You\Desktop\checkin\signin.py
+# ====== 一般不用改；本机私有路径写进 .install-local.ps1 ======
+# 本机如果用户 PATH 里没有 pythonw，在本脚本同目录建 .install-local.ps1，
+# 内容例如：  $ManualPythonw = "C:\Python313\pythonw.exe"
+# 该文件已在 .gitignore 中排除：本机配置不污染通用脚本，也不会破坏安装脚本测试。
+$ManualPythonw = ""
+$ManualSignin  = ""
+$LocalOverride = ""
+if ($PSScriptRoot) { $LocalOverride = Join-Path $PSScriptRoot ".install-local.ps1" }
+if ($LocalOverride -and (Test-Path -LiteralPath $LocalOverride)) {
+    . $LocalOverride
+}
 # ====================================================
 
 function Find-Pythonw {
@@ -74,7 +82,7 @@ if (-not $pythonw -or -not (Test-Path -LiteralPath $pythonw)) {
     Write-Host " 失败" -ForegroundColor Red
     Write-Host ""
     Write-Host "没找到 pythonw.exe。请先安装 Python 3：https://www.python.org/downloads/" -ForegroundColor Yellow
-    Write-Host "装好后重跑本脚本；或把脚本顶部的 `$ManualPythonw 填成完整路径。" -ForegroundColor Yellow
+    Write-Host "装好后重跑本脚本；或在同目录 .install-local.ps1 里填 `$ManualPythonw 完整路径。" -ForegroundColor Yellow
     exit 1
 }
 Write-Host " $pythonw" -ForegroundColor Green
@@ -92,7 +100,7 @@ if (-not $signin -or -not (Test-Path -LiteralPath $signin)) {
     Write-Host " 失败" -ForegroundColor Red
     Write-Host ""
     Write-Host "没找到 signin.py。请把本脚本和 signin.py 放在同一目录后重跑，" -ForegroundColor Yellow
-    Write-Host "或把脚本顶部的 `$ManualSignin 填成完整路径。" -ForegroundColor Yellow
+    Write-Host "或在同目录 .install-local.ps1 里填 `$ManualSignin 完整路径。" -ForegroundColor Yellow
     exit 1
 }
 $signin = (Resolve-Path -LiteralPath $signin).Path

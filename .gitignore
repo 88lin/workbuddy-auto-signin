@@ -9,3 +9,17 @@ signin.log
 qoder_signin.log
 # 多账号凭据快照：本机登录凭据副本，绝不能提交
 accounts/
+# 本机运维备份：含客户端登录态/任务定义，绝不能提交
+backups/
+
+# 本机安装脚本私有覆盖（pythonw 绝对路径等），不污染通用脚本
+.install-local.ps1
+
+# hub 统一控制台运行时数据（状态/日志/锁），非源码
+hub.log
+hub-state.json
+hub.lock
+hub-selftest.lock
+
+# 一次性诊断脚本，用完即删
+_debug_*.py
