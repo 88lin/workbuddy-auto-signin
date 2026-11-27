@@ -882,9 +882,22 @@ def _registry_lock(timeout=REGISTRY_LOCK_TIMEOUT):
     """
     directory = accounts_dir()
     os.makedirs(directory, exist_ok=True)
-    handle = open(os.path.join(directory, REGISTRY_LOCK_NAME), "a+b")
+    lock_path = os.path.join(directory, REGISTRY_LOCK_NAME)
+    # Windows 上多个进程同时 open 同一锁文件时，open() 本身就可能因共享模式
+    # 冲突抛 PermissionError（Errno 13），发生在 msvcrt.locking 之前。
+    # 把 open 也纳入重试，让所有锁竞争都以同一 AccountsError 语义失败，
+    # 避免并发 bind 因未捕获的 OSError 直接崩溃。
+    deadline = time.monotonic() + timeout
+    handle = None
+    while handle is None:
+        try:
+            handle = open(lock_path, "a+b")
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise AccountsError("ERROR", "账号清单正被另一个进程占用，请稍后重试")
+            time.sleep(0.05)
     try:
-        _acquire_registry_lock(handle, timeout)
+        _acquire_registry_lock(handle, max(0.1, deadline - time.monotonic()))
         try:
             yield
         finally:
